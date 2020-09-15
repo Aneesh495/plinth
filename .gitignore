@@ -1,0 +1,49 @@
+# Build and compilation outputs
+build/
+bin/classes/
+out/
+target/
+*.class
+*.jar
+!lib/frege3.24.405.jar
+!lib/frege.jar
+!gradle/wrapper/gradle-wrapper.jar
+
+# Native artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+c_src/*.o
+c_src/libplinth_client.*
+c_src/test_client
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+.pytest_cache/
+.venv/
+venv/
+
+# Storage and runtime data
+data/
+wal/
+*.wal
+*.sst
+*.log
+
+# IDE & Editor
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Temporary scratch
+tmp/
+.gradle/
