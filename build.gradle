@@ -1,0 +1,65 @@
+plugins {
+    id 'java'
+    id 'application'
+}
+
+group = 'org.plinth'
+version = '0.1.0'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation files('lib/frege3.24.405.jar')
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+}
+
+sourceSets {
+    main {
+        java {
+            srcDirs = ['src/main/java']
+        }
+        resources {
+            srcDirs = ['src/main/resources']
+        }
+    }
+    test {
+        java {
+            srcDirs = ['src/test/java']
+        }
+    }
+}
+
+task compileFrege(type: JavaExec) {
+    dependsOn compileJava
+    description = 'Compiles Frege source modules to JVM bytecode'
+    classpath = files('lib/frege3.24.405.jar', sourceSets.main.java.classesDirectory)
+    mainClass = 'frege.compiler.Main'
+    
+    def outDir = file("$buildDir/classes/frege/main")
+    def srcDir = file("src/main/frege")
+    
+    doFirst {
+        outDir.mkdirs()
+    }
+    
+    args = [
+        '-make',
+        '-d', outDir.absolutePath,
+        '-sp', srcDir.absolutePath,
+        '-fp', "${sourceSets.main.java.classesDirectory.get().asFile.absolutePath}:${outDir.absolutePath}",
+        'src/main/frege/org/plinth/Main.fr'
+    ]
+}
+
+classes.dependsOn compileFrege
+
+application {
+    mainClass = 'org.plinth.Main'
+}
