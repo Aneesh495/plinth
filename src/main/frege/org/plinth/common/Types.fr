@@ -1,0 +1,151 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.common.Types
+    Description: Fundamental stream primitives, monotonic timestamps, row identifiers, and watermarks.
+-}
+
+module org.plinth.common.Types where
+
+import frege.data.Bits
+
+--- Monotonic epoch timestamp in microseconds.
+newtype Timestamp = Timestamp Long
+
+derive Eq Timestamp
+derive Ord Timestamp
+
+instance Show Timestamp where
+    show (Timestamp t) = show t ++ "us"
+
+--- Microsecond duration between stream events.
+newtype Duration = Duration Long
+
+derive Eq Duration
+derive Ord Duration
+
+instance Show Duration where
+    show (Duration d) = show d ++ "us"
+
+--- Compute difference between two timestamps.
+timeDiff :: Timestamp -> Timestamp -> Duration
+timeDiff (Timestamp a) (Timestamp b) = Duration (a - b)
+
+--- Add a duration to a timestamp.
+timeAdd :: Timestamp -> Duration -> Timestamp
+timeAdd (Timestamp t) (Duration d) = Timestamp (t + d)
+
+--- Subtract a duration from a timestamp.
+timeSub :: Timestamp -> Duration -> Timestamp
+timeSub (Timestamp t) (Duration d) = Timestamp (t - d)
+
+--- Convert milliseconds to Duration.
+millis :: Long -> Duration
+millis m = Duration (m * 1000L)
+
+--- Convert seconds to Duration.
+seconds :: Long -> Duration
+seconds s = Duration (s * 1000000L)
+
+--- Convert minutes to Duration.
+minutes :: Long -> Duration
+minutes m = Duration (m * 60000000L)
+
+--- Zero timestamp constant.
+epochZero :: Timestamp
+epochZero = Timestamp 0L
+
+--- Maximum theoretical timestamp for upper bounds.
+epochMax :: Timestamp
+epochMax = Timestamp 9223372036854775807L
+
+--- Unique 64-bit identifier for stream events.
+--- Encodes a 16-bit partition ID and a 48-bit monotonic sequence counter.
+newtype RowId = RowId Long
+
+derive Eq RowId
+derive Ord RowId
+
+instance Show RowId where
+    show (RowId r) = "row#" ++ show r
+
+--- Construct a RowId from partition ID and sequence number.
+makeRowId :: Int -> Long -> RowId
+makeRowId partition seqNum =
+    let p = (fromIntegral partition :: Long) .&. 0xFFFFL
+        s = seqNum .&. 0x0000FFFFFFFFFFFFL
+        packed = (p `shiftL` 48) .|. s
+    in RowId packed
+
+--- Extract partition identifier from RowId.
+rowPartition :: RowId -> Int
+rowPartition (RowId r) = fromIntegral ((r `shiftR` 48) .&. 0xFFFFL)
+
+--- Extract sequence number from RowId.
+rowSeqNum :: RowId -> Long
+rowSeqNum (RowId r) = r .&. 0x0000FFFFFFFFFFFFL
+
+--- Transaction and snapshot identifier.
+newtype TxId = TxId Long
+
+derive Eq TxId
+derive Ord TxId
+
+instance Show TxId where
+    show (TxId t) = "tx#" ++ show t
+
+--- Named stream identifier.
+newtype StreamId = StreamId String
+
+derive Eq StreamId
+derive Ord StreamId
+
+instance Show StreamId where
+    show (StreamId s) = s
+
+--- Monotonic event-time watermark progression.
+data Watermark = 
+      WatermarkTime Timestamp
+    | WatermarkNone
+    | WatermarkInfinity
+
+derive Eq Watermark
+derive Ord Watermark
+
+instance Show Watermark where
+    show (WatermarkTime t) = "WM(" ++ show t ++ ")"
+    show WatermarkNone     = "WM(None)"
+    show WatermarkInfinity = "WM(Infinity)"
+
+--- Check if an event timestamp is late relative to a watermark.
+isLateEvent :: Timestamp -> Watermark -> Bool
+isLateEvent _ WatermarkNone = false
+isLateEvent _ WatermarkInfinity = true
+isLateEvent (Timestamp eventTime) (WatermarkTime (Timestamp wmTime)) = eventTime < wmTime
+
+--- Advance a watermark to a new timestamp, preserving monotonicity.
+advanceWatermark :: Watermark -> Timestamp -> Watermark
+advanceWatermark WatermarkInfinity _ = WatermarkInfinity
+advanceWatermark WatermarkNone t = WatermarkTime t
+advanceWatermark (WatermarkTime (Timestamp cur)) (Timestamp next)
+    | next > cur = WatermarkTime (Timestamp next)
+    | otherwise  = WatermarkTime (Timestamp cur)
+
+--- Stream sorting and partition ordering.
+data SortDirection = Ascending | Descending
+
+derive Eq SortDirection
+derive Ord SortDirection
+
+instance Show SortDirection where
+    show Ascending  = "ASC"
+    show Descending = "DESC"
+
+--- Null placement in stream ordering.
+data NullOrdering = NullsFirst | NullsLast
+
+derive Eq NullOrdering
+derive Ord NullOrdering
+
+instance Show NullOrdering where
+    show NullsFirst = "NULLS FIRST"
+    show NullsLast  = "NULLS LAST"
