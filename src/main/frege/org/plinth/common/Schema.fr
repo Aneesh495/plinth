@@ -1,0 +1,122 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.common.Schema
+    Description: Relational stream schemas, typed fields, and schema projections.
+-}
+
+module org.plinth.common.Schema where
+
+import frege.data.List
+import org.plinth.common.Types
+
+--- Supported scalar and compound data types.
+data DataType =
+      TypeBool
+    | TypeInt32
+    | TypeInt64
+    | TypeFloat64
+    | TypeString
+    | TypeTimestamp
+    | TypeBinary
+    | TypeDecimal Int Int
+
+derive Eq DataType
+derive Ord DataType
+
+instance Show DataType where
+    show TypeBool           = "BOOLEAN"
+    show TypeInt32          = "INT32"
+    show TypeInt64          = "INT64"
+    show TypeFloat64        = "FLOAT64"
+    show TypeString         = "STRING"
+    show TypeTimestamp      = "TIMESTAMP"
+    show TypeBinary         = "BINARY"
+    show (TypeDecimal p s)  = "DECIMAL(" ++ show p ++ "," ++ show s ++ ")"
+
+--- Returns the fixed physical byte width of fixed-width types, or Nothing for variable-width types.
+typePhysicalWidth :: DataType -> Maybe Int
+typePhysicalWidth TypeBool        = Just 1
+typePhysicalWidth TypeInt32       = Just 4
+typePhysicalWidth TypeInt64       = Just 8
+typePhysicalWidth TypeFloat64     = Just 8
+typePhysicalWidth TypeTimestamp   = Just 8
+typePhysicalWidth (TypeDecimal _ _) = Just 16
+typePhysicalWidth TypeString      = Nothing
+typePhysicalWidth TypeBinary      = Nothing
+
+--- A named and typed field in a relational stream schema.
+data Field = Field {
+    name       :: String,
+    dataType   :: DataType,
+    nullable   :: Bool
+}
+
+derive Eq Field
+derive Ord Field
+
+instance Show Field where
+    show f = f.name ++ " " ++ show f.dataType ++ (if f.nullable then "" else " NOT NULL")
+
+--- A relational schema defining an ordered sequence of fields.
+data Schema = Schema {
+    fields :: [Field]
+}
+
+derive Eq Schema
+derive Ord Schema
+
+instance Show Schema where
+    show (Schema fs) = "(" ++ joined ", " (map show fs) ++ ")"
+
+--- Construct a schema from a list of fields.
+makeSchema :: [Field] -> Schema
+makeSchema fs = Schema fs
+
+--- Construct a non-nullable field.
+requiredField :: String -> DataType -> Field
+requiredField n t = Field n t false
+
+--- Construct a nullable field.
+optionalField :: String -> DataType -> Field
+optionalField n t = Field n t true
+
+--- Return the number of fields in the schema.
+schemaSize :: Schema -> Int
+schemaSize (Schema fs) = length fs
+
+--- Retrieve field names as a list of strings.
+fieldNames :: Schema -> [String]
+fieldNames (Schema fs) = map Field.name fs
+
+--- Find field by name, returning its zero-based column index and definition.
+findField :: String -> Schema -> Maybe (Int, Field)
+findField targetName (Schema fs) = go 0 fs where
+    go _ [] = Nothing
+    go idx (f:rest)
+        | f.name == targetName = Just (idx, f)
+        | otherwise            = go (idx + 1) rest
+
+--- Retrieve field at specific index.
+fieldAt :: Int -> Schema -> Maybe Field
+fieldAt idx (Schema fs)
+    | idx >= 0 && idx < length fs = Just (fs !! idx)
+    | otherwise                   = Nothing
+
+--- Project a subset of fields from a schema by name.
+projectSchema :: [String] -> Schema -> Maybe Schema
+projectSchema [] _ = Just (Schema [])
+projectSchema (n:ns) schema = case findField n schema of
+    Nothing     -> Nothing
+    Just (_, f) -> case projectSchema ns schema of
+        Nothing          -> Nothing
+        Just (Schema fs) -> Just (Schema (f : fs))
+
+--- Combine two schemas for join operations.
+mergeSchemas :: Schema -> Schema -> Schema
+mergeSchemas (Schema leftFs) (Schema rightFs) = Schema (leftFs ++ rightFs)
+
+--- Check whether two schemas have compatible data types in the same positions.
+isTypeCompatible :: Schema -> Schema -> Bool
+isTypeCompatible (Schema s1) (Schema s2)
+    | length s1 /= length s2 = false
+    | otherwise = all (\(f1, f2) -> f1.dataType == f2.dataType) (zip s1 s2)
