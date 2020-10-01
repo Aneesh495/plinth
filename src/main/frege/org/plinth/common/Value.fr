@@ -1,0 +1,171 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.common.Value
+    Description: Dynamic runtime values, scalar arithmetic, and three-valued logic.
+-}
+
+module org.plinth.common.Value where
+
+import org.plinth.common.Types
+import org.plinth.common.Schema
+
+--- Dynamic scalar value representation.
+data Value =
+      ValNull
+    | ValBool Bool
+    | ValInt Int
+    | ValLong Long
+    | ValDouble Double
+    | ValString String
+    | ValTimestamp Timestamp
+
+derive Eq Value
+derive Ord Value
+
+instance Show Value where
+    show ValNull           = "NULL"
+    show (ValBool b)       = if b then "true" else "false"
+    show (ValInt i)        = show i
+    show (ValLong l)       = show l ++ "L"
+    show (ValDouble d)     = show d
+    show (ValString s)     = "'" ++ s ++ "'"
+    show (ValTimestamp t)  = show t
+
+--- Return the matching DataType for a given Value.
+valueType :: Value -> Maybe DataType
+valueType ValNull          = Nothing
+valueType (ValBool _)      = Just TypeBool
+valueType (ValInt _)       = Just TypeInt32
+valueType (ValLong _)      = Just TypeInt64
+valueType (ValDouble _)    = Just TypeFloat64
+valueType (ValString _)    = Just TypeString
+valueType (ValTimestamp _) = Just TypeTimestamp
+
+--- Check if value is null.
+isNull :: Value -> Bool
+isNull ValNull = true
+isNull _       = false
+
+--- Extract boolean with default fallback.
+asBool :: Value -> Bool -> Bool
+asBool (ValBool b) _ = b
+asBool _ def         = def
+
+--- Extract integer with default fallback.
+asInt :: Value -> Int -> Int
+asInt (ValInt i) _  = i
+asInt (ValLong l) _ = fromIntegral l
+asInt _ def         = def
+
+--- Extract long integer with default fallback.
+asLong :: Value -> Long -> Long
+asLong (ValLong l) _ = l
+asLong (ValInt i) _  = fromIntegral i
+asLong _ def         = def
+
+--- Extract double with default fallback.
+asDouble :: Value -> Double -> Double
+asDouble (ValDouble d) _ = d
+asDouble (ValInt i) _    = fromIntegral i
+asDouble (ValLong l) _   = fromIntegral l
+asDouble _ def           = def
+
+--- Extract string representation.
+asString :: Value -> String
+asString (ValString s) = s
+asString v             = show v
+
+--- Add two scalar values with type coercion.
+valAdd :: Value -> Value -> Value
+valAdd ValNull _ = ValNull
+valAdd _ ValNull = ValNull
+valAdd (ValInt a) (ValInt b)       = ValInt (a + b)
+valAdd (ValLong a) (ValLong b)     = ValLong (a + b)
+valAdd (ValInt a) (ValLong b)      = ValLong (fromIntegral a + b)
+valAdd (ValLong a) (ValInt b)      = ValLong (a + fromIntegral b)
+valAdd (ValDouble a) (ValDouble b) = ValDouble (a + b)
+valAdd (ValDouble a) (ValInt b)    = ValDouble (a + fromIntegral b)
+valAdd (ValInt a) (ValDouble b)    = ValDouble (fromIntegral a + b)
+valAdd (ValDouble a) (ValLong b)   = ValDouble (a + fromIntegral b)
+valAdd (ValLong a) (ValDouble b)   = ValDouble (fromIntegral a + b)
+valAdd (ValString a) (ValString b) = ValString (a ++ b)
+valAdd _ _                         = ValNull
+
+--- Subtract two scalar values.
+valSub :: Value -> Value -> Value
+valSub ValNull _ = ValNull
+valSub _ ValNull = ValNull
+valSub (ValInt a) (ValInt b)       = ValInt (a - b)
+valSub (ValLong a) (ValLong b)     = ValLong (a - b)
+valSub (ValInt a) (ValLong b)      = ValLong (fromIntegral a - b)
+valSub (ValLong a) (ValInt b)      = ValLong (a - fromIntegral b)
+valSub (ValDouble a) (ValDouble b) = ValDouble (a - b)
+valSub (ValDouble a) (ValInt b)    = ValDouble (a - fromIntegral b)
+valSub (ValInt a) (ValDouble b)    = ValDouble (fromIntegral a - b)
+valSub (ValDouble a) (ValLong b)   = ValDouble (a - fromIntegral b)
+valSub (ValLong a) (ValDouble b)   = ValDouble (fromIntegral a - b)
+valSub _ _                         = ValNull
+
+--- Multiply two scalar values.
+valMul :: Value -> Value -> Value
+valMul ValNull _ = ValNull
+valMul _ ValNull = ValNull
+valMul (ValInt a) (ValInt b)       = ValInt (a * b)
+valMul (ValLong a) (ValLong b)     = ValLong (a * b)
+valMul (ValInt a) (ValLong b)      = ValLong (fromIntegral a * b)
+valMul (ValLong a) (ValInt b)      = ValLong (a * fromIntegral b)
+valMul (ValDouble a) (ValDouble b) = ValDouble (a * b)
+valMul (ValDouble a) (ValInt b)    = ValDouble (a * fromIntegral b)
+valMul (ValInt a) (ValDouble b)    = ValDouble (fromIntegral a * b)
+valMul (ValDouble a) (ValLong b)   = ValDouble (a * fromIntegral b)
+valMul (ValLong a) (ValDouble b)   = ValDouble (fromIntegral a * b)
+valMul _ _                         = ValNull
+
+--- Divide two scalar values with division-by-zero protection.
+valDiv :: Value -> Value -> Value
+valDiv ValNull _ = ValNull
+valDiv _ ValNull = ValNull
+valDiv (ValInt _) (ValInt 0)         = ValNull
+valDiv (ValInt a) (ValInt b)         = ValInt (a `div` b)
+valDiv (ValLong _) (ValLong 0L)      = ValNull
+valDiv (ValLong a) (ValLong b)       = ValLong (a `div` b)
+valDiv (ValDouble a) (ValDouble b)
+    | b == 0.0 = ValNull
+    | otherwise = ValDouble (a / b)
+valDiv (ValDouble a) (ValInt b)
+    | b == 0 = ValNull
+    | otherwise = ValDouble (a / fromIntegral b)
+valDiv (ValInt a) (ValDouble b)
+    | b == 0.0 = ValNull
+    | otherwise = ValDouble (fromIntegral a / b)
+valDiv _ _ = ValNull
+
+--- Negate a scalar numeric value.
+valNegate :: Value -> Value
+valNegate ValNull        = ValNull
+valNegate (ValInt i)     = ValInt (-i)
+valNegate (ValLong l)    = ValLong (-l)
+valNegate (ValDouble d)  = ValDouble (-d)
+valNegate _              = ValNull
+
+pure native doubleToLong "(long)" :: Double -> Long
+pure native doubleToInt "(int)" :: Double -> Int
+
+--- Explicit cast to a specified target DataType.
+castValue :: DataType -> Value -> Maybe Value
+castValue _ ValNull = Just ValNull
+castValue TypeBool (ValBool b) = Just (ValBool b)
+castValue TypeBool (ValInt i)  = Just (ValBool (i /= 0))
+castValue TypeInt32 (ValInt i) = Just (ValInt i)
+castValue TypeInt32 (ValLong l) = Just (ValInt (fromIntegral l))
+castValue TypeInt32 (ValDouble d) = Just (ValInt (doubleToInt d))
+castValue TypeInt64 (ValLong l) = Just (ValLong l)
+castValue TypeInt64 (ValInt i)  = Just (ValLong (fromIntegral i))
+castValue TypeInt64 (ValDouble d) = Just (ValLong (doubleToLong d))
+castValue TypeFloat64 (ValDouble d) = Just (ValDouble d)
+castValue TypeFloat64 (ValInt i)    = Just (ValDouble (fromIntegral i))
+castValue TypeFloat64 (ValLong l)   = Just (ValDouble (fromIntegral l))
+castValue TypeString v              = Just (ValString (asString v))
+castValue TypeTimestamp (ValTimestamp t) = Just (ValTimestamp t)
+castValue TypeTimestamp (ValLong l)      = Just (ValTimestamp (Timestamp l))
+castValue _ _                       = Nothing
