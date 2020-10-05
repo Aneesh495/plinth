@@ -1,0 +1,128 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.common.BitSet
+    Description: Functional immutable bitmaps for validity tracking and vectorized selection vectors.
+-}
+
+module org.plinth.common.BitSet where
+
+import frege.data.Bits (shiftL, shiftR, complement, .&., .|.)
+
+--- An immutable bitmap backed by 64-bit words.
+data Bitmap = Bitmap {
+    bitCount :: Int,
+    words    :: [Long]
+}
+
+derive Eq Bitmap
+derive Ord Bitmap
+
+instance Show Bitmap where
+    show bm = "Bitmap(count=" ++ show bm.bitCount ++ ", pop=" ++ show (bitmapPopCount bm) ++ ")"
+
+--- Calculate number of 64-bit words required to hold n bits.
+numWords :: Int -> Int
+numWords n = (n + 63) `div` 64
+
+--- Create an empty bitmap of size n with all bits cleared (0).
+emptyBitmap :: Int -> Bitmap
+emptyBitmap n =
+    let nw = numWords n
+    in Bitmap n (replicate nw 0L)
+
+--- Create a bitmap of size n with all bits set (1).
+allValidBitmap :: Int -> Bitmap
+allValidBitmap n =
+    let nw = numWords n
+        remBits = n `mod` 64
+        fullWords = if remBits == 0 then nw else nw - 1
+        tailWord = if remBits == 0 then [] else [(1L `shiftL` remBits) - 1L]
+        ws = replicate fullWords 0xFFFFFFFFFFFFFFFFL ++ tailWord
+    in Bitmap n ws
+
+--- Test if bit at zero-based index i is set.
+testBitAt :: Int -> Bitmap -> Bool
+testBitAt i bm
+    | i < 0 || i >= bm.bitCount = false
+    | otherwise =
+        let wordIdx = i `div` 64
+            bitIdx  = i `mod` 64
+            w = if wordIdx < length bm.words then bm.words !! wordIdx else 0L
+        in (w .&. (1L `shiftL` bitIdx)) /= 0L
+
+--- Set bit at index i to 1.
+setBitAt :: Int -> Bitmap -> Bitmap
+setBitAt i bm
+    | i < 0 || i >= bm.bitCount = bm
+    | otherwise =
+        let wordIdx = i `div` 64
+            bitIdx  = i `mod` 64
+            mask    = 1L `shiftL` bitIdx
+            newWords = updateWord wordIdx (\w -> w .|. mask) bm.words
+        in Bitmap bm.bitCount newWords
+
+--- Clear bit at index i to 0.
+clearBitAt :: Int -> Bitmap -> Bitmap
+clearBitAt i bm
+    | i < 0 || i >= bm.bitCount = bm
+    | otherwise =
+        let wordIdx = i `div` 64
+            bitIdx  = i `mod` 64
+            mask    = complement (1L `shiftL` bitIdx)
+            newWords = updateWord wordIdx (\w -> w .&. mask) bm.words
+        in Bitmap bm.bitCount newWords
+
+--- Helper to update a single word in the word list.
+updateWord :: Int -> (Long -> Long) -> [Long] -> [Long]
+updateWord _ _ [] = []
+updateWord 0 f (w:ws) = f w : ws
+updateWord n f (w:ws) = w : updateWord (n - 1) f ws
+
+--- Hardware/software population count for a 64-bit word.
+wordPopCount :: Long -> Int
+wordPopCount x0 =
+    let x1 = x0 - ((x0 `shiftR` 1) .&. 0x5555555555555555L)
+        x2 = (x1 .&. 0x3333333333333333L) + ((x1 `shiftR` 2) .&. 0x3333333333333333L)
+        x3 = (x2 + (x2 `shiftR` 4)) .&. 0x0F0F0F0F0F0F0F0FL
+        x4 = x3 + (x3 `shiftR` 8)
+        x5 = x4 + (x4 `shiftR` 16)
+        x6 = x5 + (x5 `shiftR` 32)
+    in fromIntegral (x6 .&. 0x7FL)
+
+--- Total number of set bits in the bitmap.
+bitmapPopCount :: Bitmap -> Int
+bitmapPopCount bm = sum (map wordPopCount bm.words)
+
+--- Bitwise AND of two bitmaps of identical size.
+bitmapAnd :: Bitmap -> Bitmap -> Bitmap
+bitmapAnd bm1 bm2 =
+    let n = min bm1.bitCount bm2.bitCount
+        combined = zipWith (.&.) bm1.words bm2.words
+    in Bitmap n combined
+
+--- Bitwise OR of two bitmaps of identical size.
+bitmapOr :: Bitmap -> Bitmap -> Bitmap
+bitmapOr bm1 bm2 =
+    let n = max bm1.bitCount bm2.bitCount
+        combined = zipWith (.|.) bm1.words bm2.words
+    in Bitmap n combined
+
+--- Bitwise NOT (complement) of a bitmap.
+bitmapNot :: Bitmap -> Bitmap
+bitmapNot bm =
+    let nw = numWords bm.bitCount
+        remBits = bm.bitCount `mod` 64
+        maskTail idx w =
+            if idx == nw - 1 && remBits /= 0
+            then complement w .&. ((1L `shiftL` remBits) - 1L)
+            else complement w
+        inverted = zipWith maskTail [0 .. nw - 1] bm.words
+    in Bitmap bm.bitCount inverted
+
+--- Extract all integer indices where the bit is set to 1.
+bitmapIndices :: Bitmap -> [Int]
+bitmapIndices bm = go 0 0 bm.words where
+    go _ _ [] = []
+    go baseIdx wordIdx (w:ws) =
+        let indicesInWord = [baseIdx + bit | bit <- [0..63], (baseIdx + bit) < bm.bitCount, (w .&. (1L `shiftL` bit)) /= 0L]
+        in indicesInWord ++ go (baseIdx + 64) (wordIdx + 1) ws
