@@ -1,0 +1,162 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.vector.ColumnVector
+    Description: Columnar typed vector representations with validity bitmaps and zero-copy slicing.
+-}
+
+module org.plinth.vector.ColumnVector where
+
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.common.BitSet
+
+--- A columnar vector chunk holding typed scalar values and an associated validity bitmap.
+data ColumnVector =
+      BoolVector      { validity :: Bitmap, bValues :: [Bool] }
+    | Int32Vector     { validity :: Bitmap, iValues :: [Int] }
+    | Int64Vector     { validity :: Bitmap, lValues :: [Long] }
+    | Float64Vector   { validity :: Bitmap, dValues :: [Double] }
+    | StringVector    { validity :: Bitmap, sValues :: [String] }
+    | TimestampVector { validity :: Bitmap, tValues :: [Timestamp] }
+
+derive Eq ColumnVector
+derive Ord ColumnVector
+
+instance Show ColumnVector where
+    show cv = "ColumnVector(type=" ++ show (columnVectorType cv) ++
+              ", len=" ++ show (columnVectorLength cv) ++
+              ", nulls=" ++ show (columnVectorNullCount cv) ++ ")"
+
+--- Return the logical DataType of the vector.
+columnVectorType :: ColumnVector -> DataType
+columnVectorType (BoolVector _ _)      = TypeBool
+columnVectorType (Int32Vector _ _)     = TypeInt32
+columnVectorType (Int64Vector _ _)     = TypeInt64
+columnVectorType (Float64Vector _ _)   = TypeFloat64
+columnVectorType (StringVector _ _)    = TypeString
+columnVectorType (TimestampVector _ _) = TypeTimestamp
+
+--- Return the number of elements in the vector.
+columnVectorLength :: ColumnVector -> Int
+columnVectorLength cv = (columnVectorValidity cv).bitCount
+
+--- Return the validity bitmap of the vector.
+columnVectorValidity :: ColumnVector -> Bitmap
+columnVectorValidity (BoolVector v _)      = v
+columnVectorValidity (Int32Vector v _)     = v
+columnVectorValidity (Int64Vector v _)     = v
+columnVectorValidity (Float64Vector v _)   = v
+columnVectorValidity (StringVector v _)    = v
+columnVectorValidity (TimestampVector v _) = v
+
+--- Return the count of null values in the vector.
+columnVectorNullCount :: ColumnVector -> Int
+columnVectorNullCount cv =
+    let total = columnVectorLength cv
+        valid = bitmapPopCount (columnVectorValidity cv)
+    in total - valid
+
+--- Retrieve the value at row index i as a dynamic Value.
+columnVectorGet :: Int -> ColumnVector -> Value
+columnVectorGet i cv
+    | i < 0 || i >= columnVectorLength cv = ValNull
+    | not (testBitAt i (columnVectorValidity cv)) = ValNull
+    | otherwise = case cv of
+        BoolVector _ vs      -> ValBool (vs !! i)
+        Int32Vector _ vs     -> ValInt (vs !! i)
+        Int64Vector _ vs     -> ValLong (vs !! i)
+        Float64Vector _ vs   -> ValDouble (vs !! i)
+        StringVector _ vs    -> ValString (vs !! i)
+        TimestampVector _ vs -> ValTimestamp (vs !! i)
+
+--- Slice a sub-vector starting at offset with specified length.
+columnVectorSlice :: Int -> Int -> ColumnVector -> ColumnVector
+columnVectorSlice offset len cv =
+    let safeOffset = max 0 offset
+        safeLen    = min len (max 0 (columnVectorLength cv - safeOffset))
+        indices    = [safeOffset .. safeOffset + safeLen - 1]
+        newBm      = buildSlicedBitmap cv indices
+    in case cv of
+        BoolVector _ vs      -> BoolVector newBm (sliceList safeOffset safeLen vs)
+        Int32Vector _ vs     -> Int32Vector newBm (sliceList safeOffset safeLen vs)
+        Int64Vector _ vs     -> Int64Vector newBm (sliceList safeOffset safeLen vs)
+        Float64Vector _ vs   -> Float64Vector newBm (sliceList safeOffset safeLen vs)
+        StringVector _ vs    -> StringVector newBm (sliceList safeOffset safeLen vs)
+        TimestampVector _ vs -> TimestampVector newBm (sliceList safeOffset safeLen vs)
+
+--- Helper to slice a list.
+sliceList :: Int -> Int -> [a] -> [a]
+sliceList offset len xs = take len (drop offset xs)
+
+--- Build sliced validity bitmap for subrange.
+buildSlicedBitmap :: ColumnVector -> [Int] -> Bitmap
+buildSlicedBitmap cv idxs =
+    let bm = emptyBitmap (length idxs)
+        oldBm = columnVectorValidity cv
+        setIfValid (newIdx, oldIdx) curBm =
+            if testBitAt oldIdx oldBm
+            then setBitAt newIdx curBm
+            else curBm
+    in foldr setIfValid bm (zip [0..] idxs)
+
+--- Construct a ColumnVector from a list of dynamic values and schema type.
+fromValues :: DataType -> [Value] -> ColumnVector
+fromValues dt vals =
+    let len = length vals
+        bm0 = emptyBitmap len
+        (bm, extracted) = buildFromValues dt vals 0 bm0
+    in extracted
+
+--- Recursive builder for typed values and bitmap.
+buildFromValues :: DataType -> [Value] -> Int -> Bitmap -> (Bitmap, ColumnVector)
+buildFromValues TypeBool vals idx bm =
+    let boolList = map (`asBool` false) vals
+        validBm  = foldr (\(i, v) b -> if isNull v then b else setBitAt i b) bm (zip [0..] vals)
+    in (validBm, BoolVector validBm boolList)
+
+buildFromValues TypeInt32 vals idx bm =
+    let intList = map (`asInt` 0) vals
+        validBm = foldr (\(i, v) b -> if isNull v then b else setBitAt i b) bm (zip [0..] vals)
+    in (validBm, Int32Vector validBm intList)
+
+buildFromValues TypeInt64 vals idx bm =
+    let longList = map (`asLong` 0L) vals
+        validBm  = foldr (\(i, v) b -> if isNull v then b else setBitAt i b) bm (zip [0..] vals)
+    in (validBm, Int64Vector validBm longList)
+
+buildFromValues TypeFloat64 vals idx bm =
+    let dblList = map (`asDouble` 0.0) vals
+        validBm = foldr (\(i, v) b -> if isNull v then b else setBitAt i b) bm (zip [0..] vals)
+    in (validBm, Float64Vector validBm dblList)
+
+buildFromValues TypeString vals idx bm =
+    let strList = map asString vals
+        validBm = foldr (\(i, v) b -> if isNull v then b else setBitAt i b) bm (zip [0..] vals)
+    in (validBm, StringVector validBm strList)
+
+buildFromValues TypeTimestamp vals idx bm =
+    let tsList  = map extractTimestamp vals
+        validBm = foldr (\(i, v) b -> if isNull v then b else setBitAt i b) bm (zip [0..] vals)
+    in (validBm, TimestampVector validBm tsList)
+
+buildFromValues _ vals idx bm =
+    -- Fallback default as string vector
+    buildFromValues TypeString vals idx bm
+
+--- Extract timestamp safely from Value.
+extractTimestamp :: Value -> Timestamp
+extractTimestamp (ValTimestamp t) = t
+extractTimestamp (ValLong l)      = Timestamp l
+extractTimestamp _                = epochZero
+
+--- Convert a ColumnVector into a list of dynamic values.
+toValues :: ColumnVector -> [Value]
+toValues cv = [columnVectorGet i cv | i <- [0 .. columnVectorLength cv - 1]]
+
+--- Filter a vector using a selection bitmap (gather operation).
+filterVector :: Bitmap -> ColumnVector -> ColumnVector
+filterVector selection cv =
+    let validIndices = bitmapIndices selection
+        filteredVals = [columnVectorGet i cv | i <- validIndices]
+    in fromValues (columnVectorType cv) filteredVals
