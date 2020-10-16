@@ -1,0 +1,178 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.vector.VectorOps
+    Description: Vectorized arithmetic, relational comparisons, and selection bitmap evaluation.
+-}
+
+module org.plinth.vector.VectorOps where
+
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.common.BitSet
+import org.plinth.vector.ColumnVector
+
+--- Vectorized equality comparison against a scalar literal, returning a selection Bitmap.
+vecEq :: ColumnVector -> Value -> Bitmap
+vecEq cv literal =
+    let n = columnVectorLength cv
+        bm = emptyBitmap n
+        matchIdx i b =
+            let v = columnVectorGet i cv
+            in if not (isNull v) && v == literal
+               then setBitAt i b
+               else b
+    in foldr matchIdx bm [0 .. n - 1]
+
+--- Vectorized inequality comparison against a scalar literal.
+vecNeq :: ColumnVector -> Value -> Bitmap
+vecNeq cv literal =
+    let n = columnVectorLength cv
+        bm = emptyBitmap n
+        matchIdx i b =
+            let v = columnVectorGet i cv
+            in if not (isNull v) && v /= literal
+               then setBitAt i b
+               else b
+    in foldr matchIdx bm [0 .. n - 1]
+
+--- Vectorized less-than comparison against a scalar literal.
+vecLt :: ColumnVector -> Value -> Bitmap
+vecLt cv literal =
+    let n = columnVectorLength cv
+        bm = emptyBitmap n
+        matchIdx i b =
+            let v = columnVectorGet i cv
+            in if not (isNull v) && v < literal
+               then setBitAt i b
+               else b
+    in foldr matchIdx bm [0 .. n - 1]
+
+--- Vectorized less-than-or-equal comparison against a scalar literal.
+vecLte :: ColumnVector -> Value -> Bitmap
+vecLte cv literal =
+    let n = columnVectorLength cv
+        bm = emptyBitmap n
+        matchIdx i b =
+            let v = columnVectorGet i cv
+            in if not (isNull v) && v <= literal
+               then setBitAt i b
+               else b
+    in foldr matchIdx bm [0 .. n - 1]
+
+--- Vectorized greater-than comparison against a scalar literal.
+vecGt :: ColumnVector -> Value -> Bitmap
+vecGt cv literal =
+    let n = columnVectorLength cv
+        bm = emptyBitmap n
+        matchIdx i b =
+            let v = columnVectorGet i cv
+            in if not (isNull v) && v > literal
+               then setBitAt i b
+               else b
+    in foldr matchIdx bm [0 .. n - 1]
+
+--- Vectorized greater-than-or-equal comparison against a scalar literal.
+vecGte :: ColumnVector -> Value -> Bitmap
+vecGte cv literal =
+    let n = columnVectorLength cv
+        bm = emptyBitmap n
+        matchIdx i b =
+            let v = columnVectorGet i cv
+            in if not (isNull v) && v >= literal
+               then setBitAt i b
+               else b
+    in foldr matchIdx bm [0 .. n - 1]
+
+--- Vectorized BETWEEN lower AND upper inclusive range scan.
+vecBetween :: ColumnVector -> Value -> Value -> Bitmap
+vecBetween cv lower upper =
+    let geBm = vecGte cv lower
+        leBm = vecLte cv upper
+    in bitmapAnd geBm leBm
+
+--- Vectorized IN list predicate evaluation.
+vecInList :: ColumnVector -> [Value] -> Bitmap
+vecInList cv targets =
+    let n = columnVectorLength cv
+        bm = emptyBitmap n
+        matchIdx i b =
+            let v = columnVectorGet i cv
+            in if not (isNull v) && elem v targets
+               then setBitAt i b
+               else b
+    in foldr matchIdx bm [0 .. n - 1]
+
+--- Vectorized IS NULL predicate.
+vecIsNull :: ColumnVector -> Bitmap
+vecIsNull cv = bitmapNot (columnVectorValidity cv)
+
+--- Vectorized IS NOT NULL predicate.
+vecIsNotNull :: ColumnVector -> Bitmap
+vecIsNotNull cv = columnVectorValidity cv
+
+--- Vectorized pairwise equality between two ColumnVectors of matching length.
+vecVecEq :: ColumnVector -> ColumnVector -> Bitmap
+vecVecEq cv1 cv2 =
+    let n = min (columnVectorLength cv1) (columnVectorLength cv2)
+        validBoth = bitmapAnd (columnVectorValidity cv1) (columnVectorValidity cv2)
+        bm = emptyBitmap n
+        matchIdx i b =
+            if testBitAt i validBoth && columnVectorGet i cv1 == columnVectorGet i cv2
+            then setBitAt i b
+            else b
+    in foldr matchIdx bm [0 .. n - 1]
+
+--- Vectorized pairwise less-than between two ColumnVectors.
+vecVecLt :: ColumnVector -> ColumnVector -> Bitmap
+vecVecLt cv1 cv2 =
+    let n = min (columnVectorLength cv1) (columnVectorLength cv2)
+        validBoth = bitmapAnd (columnVectorValidity cv1) (columnVectorValidity cv2)
+        bm = emptyBitmap n
+        matchIdx i b =
+            if testBitAt i validBoth && columnVectorGet i cv1 < columnVectorGet i cv2
+            then setBitAt i b
+            else b
+    in foldr matchIdx bm [0 .. n - 1]
+
+--- Vectorized pairwise addition of two numeric vectors.
+vecAdd :: ColumnVector -> ColumnVector -> ColumnVector
+vecAdd cv1 cv2 =
+    let n = min (columnVectorLength cv1) (columnVectorLength cv2)
+        resVals = [valAdd (columnVectorGet i cv1) (columnVectorGet i cv2) | i <- [0 .. n - 1]]
+    in fromValues (columnVectorType cv1) resVals
+
+--- Vectorized pairwise subtraction of two numeric vectors.
+vecSub :: ColumnVector -> ColumnVector -> ColumnVector
+vecSub cv1 cv2 =
+    let n = min (columnVectorLength cv1) (columnVectorLength cv2)
+        resVals = [valSub (columnVectorGet i cv1) (columnVectorGet i cv2) | i <- [0 .. n - 1]]
+    in fromValues (columnVectorType cv1) resVals
+
+--- Vectorized pairwise multiplication of two numeric vectors.
+vecMul :: ColumnVector -> ColumnVector -> ColumnVector
+vecMul cv1 cv2 =
+    let n = min (columnVectorLength cv1) (columnVectorLength cv2)
+        resVals = [valMul (columnVectorGet i cv1) (columnVectorGet i cv2) | i <- [0 .. n - 1]]
+    in fromValues (columnVectorType cv1) resVals
+
+--- Vectorized pairwise division of two numeric vectors.
+vecDiv :: ColumnVector -> ColumnVector -> ColumnVector
+vecDiv cv1 cv2 =
+    let n = min (columnVectorLength cv1) (columnVectorLength cv2)
+        resVals = [valDiv (columnVectorGet i cv1) (columnVectorGet i cv2) | i <- [0 .. n - 1]]
+    in fromValues (columnVectorType cv1) resVals
+
+--- Vectorized scalar addition: v + scalar.
+vecScalarAdd :: ColumnVector -> Value -> ColumnVector
+vecScalarAdd cv scalar =
+    let n = columnVectorLength cv
+        resVals = [valAdd (columnVectorGet i cv) scalar | i <- [0 .. n - 1]]
+    in fromValues (columnVectorType cv) resVals
+
+--- Vectorized scalar multiplication: v * scalar.
+vecScalarMul :: ColumnVector -> Value -> ColumnVector
+vecScalarMul cv scalar =
+    let n = columnVectorLength cv
+        resVals = [valMul (columnVectorGet i cv) scalar | i <- [0 .. n - 1]]
+    in fromValues (columnVectorType cv) resVals
