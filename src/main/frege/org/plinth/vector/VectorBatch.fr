@@ -1,0 +1,108 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.vector.VectorBatch
+    Description: Columnar record batches, schema binding, projection, and slicing.
+-}
+
+module org.plinth.vector.VectorBatch where
+
+import frege.data.List
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.common.BitSet
+import org.plinth.vector.ColumnVector
+
+--- A columnar record batch binding multiple typed column vectors to a relational schema.
+data VectorBatch = VectorBatch {
+    schema   :: Schema,
+    rowCount :: Int,
+    columns  :: [ColumnVector]
+}
+
+derive Eq VectorBatch
+derive Ord VectorBatch
+
+instance Show VectorBatch where
+    show vb = "VectorBatch(rows=" ++ show vb.rowCount ++
+              ", cols=" ++ show (length vb.columns) ++
+              ", schema=" ++ show vb.schema ++ ")"
+
+--- Construct a VectorBatch with validation of column count and equal row lengths.
+makeVectorBatch :: Schema -> [ColumnVector] -> Maybe VectorBatch
+makeVectorBatch s cols
+    | length s.fields /= length cols = Nothing
+    | null cols = Just (VectorBatch s 0 [])
+    | otherwise =
+        let r0 = columnVectorLength (head cols)
+            allMatch = all (\c -> columnVectorLength c == r0) cols
+        in if allMatch
+           then Just (VectorBatch s r0 cols)
+           else Nothing
+
+--- Construct an empty batch conforming to the specified schema.
+emptyVectorBatch :: Schema -> VectorBatch
+emptyVectorBatch s =
+    let emptyCols = map (\f -> fromValues f.dataType []) s.fields
+    in VectorBatch s 0 emptyCols
+
+--- Convert a list of row tuples into a columnar VectorBatch.
+fromRows :: Schema -> [[Value]] -> VectorBatch
+fromRows s rows =
+    let numCols = length s.fields
+        transposed = [ [r !! cIdx | r <- rows] | cIdx <- [0 .. numCols - 1] ]
+        builtCols = zipWith (\f colVals -> fromValues f.dataType colVals) s.fields transposed
+        nRows = length rows
+    in VectorBatch s nRows builtCols
+
+--- Convert a VectorBatch back into row-oriented list of value tuples.
+toRows :: VectorBatch -> [[Value]]
+toRows vb =
+    let colValues = map toValues vb.columns
+    in [ [col !! rIdx | col <- colValues] | rIdx <- [0 .. vb.rowCount - 1] ]
+
+--- Retrieve column vector by field name.
+columnByName :: String -> VectorBatch -> Maybe ColumnVector
+columnByName targetName vb = case findField targetName vb.schema of
+    Nothing       -> Nothing
+    Just (idx, _) -> Just (vb.columns !! idx)
+
+--- Project a subset of named columns, creating a new VectorBatch with projected schema.
+projectBatch :: [String] -> VectorBatch -> Maybe VectorBatch
+projectBatch names vb = case projectSchema names vb.schema of
+    Nothing          -> Nothing
+    Just projSchema  ->
+        let colLookups = map (`columnByName` vb) names
+            allPresent = all isJust colLookups
+        in if allPresent
+           then Just (VectorBatch projSchema vb.rowCount (map unwrap colLookups))
+           else Nothing
+  where
+    unwrap (Just c) = c
+    unwrap Nothing  = error "unreachable"
+
+--- Slice a contiguous range of rows across all columns in the batch.
+sliceBatch :: Int -> Int -> VectorBatch -> VectorBatch
+sliceBatch offset len vb =
+    let safeOffset = max 0 offset
+        safeLen    = min len (max 0 (vb.rowCount - safeOffset))
+        slicedCols = map (columnVectorSlice safeOffset safeLen) vb.columns
+    in VectorBatch vb.schema safeLen slicedCols
+
+--- Filter a VectorBatch using a selection bitmap (gather across all columns).
+filterBatch :: Bitmap -> VectorBatch -> VectorBatch
+filterBatch selection vb =
+    let filteredCols = map (filterVector selection) vb.columns
+        newRowCount  = bitmapPopCount selection
+    in VectorBatch vb.schema newRowCount filteredCols
+
+--- Concatenate two VectorBatches sharing an identical schema.
+appendBatches :: VectorBatch -> VectorBatch -> Maybe VectorBatch
+appendBatches vb1 vb2
+    | vb1.schema /= vb2.schema = Nothing
+    | vb1.rowCount == 0 = Just vb2
+    | vb2.rowCount == 0 = Just vb1
+    | otherwise =
+        let rows1 = toRows vb1
+            rows2 = toRows vb2
+        in Just (fromRows vb1.schema (rows1 ++ rows2))
