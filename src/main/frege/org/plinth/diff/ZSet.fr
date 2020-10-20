@@ -1,0 +1,121 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.diff.ZSet
+    Description: Generalized multisets with signed integer weights forming an Abelian group.
+-}
+
+module org.plinth.diff.ZSet where
+
+import frege.data.TreeMap as TM
+import org.plinth.common.Value
+
+--- A generalized multiset mapping elements of type a to non-zero signed integer weights.
+--- Forms an Abelian group under addition with point-wise cancellation.
+data ZSet a = ZSet {
+    weightMap :: TM.TreeMap a Long
+}
+
+instance (Eq a) => Eq (ZSet a) where
+    zs1 == zs2 = toEntries zs1 == toEntries zs2
+    hashCode zs = hashCode (toEntries zs)
+
+instance (Ord a) => Ord (ZSet a) where
+    zs1 <=> zs2 = toEntries zs1 <=> toEntries zs2
+
+instance (Show a) => Show (ZSet a) where
+    show zs = "ZSet(" ++ joined ", " [show k ++ " -> " ++ show w | (k, w) <- toEntries zs] ++ ")"
+
+--- The identity element (empty Z-Set) with all weights equal to 0.
+emptyZSet :: ZSet a
+emptyZSet = ZSet empty
+
+--- Construct a singleton Z-Set with a specified weight.
+singletonZSet :: Ord a => a -> Long -> ZSet a
+singletonZSet elem weight
+    | weight == 0L = emptyZSet
+    | otherwise    = ZSet (TM.insert elem weight empty)
+
+--- Look up the weight of an element, returning 0L if absent.
+lookupWeight :: Ord a => a -> ZSet a -> Long
+lookupWeight elem (ZSet m) = case TM.lookup elem m of
+    Just w  -> w
+    Nothing -> 0L
+
+--- Update the weight of an element. If the resulting weight is 0, the element is removed.
+insertWeight :: Ord a => a -> Long -> ZSet a -> ZSet a
+insertWeight elem delta (ZSet m)
+    | delta == 0L = ZSet m
+    | otherwise   =
+        let cur = case TM.lookup elem m of
+                Just w  -> w
+                Nothing -> 0L
+            newW = cur + delta
+        in if newW == 0L
+           then ZSet (TM.delete elem m)
+           else ZSet (TM.insert elem newW m)
+
+--- Abelian group addition: (A + B)(x) = A(x) + B(x).
+addZSets :: Ord a => ZSet a -> ZSet a -> ZSet a
+addZSets (ZSet m1) zs2 =
+    fold (\acc (k, w) -> insertWeight k w acc) zs2 (TM.each m1)
+
+--- Abelian group inverse: (-A)(x) = -A(x).
+negateZSet :: ZSet a -> ZSet a
+negateZSet (ZSet m) =
+    let negated = TM.mapValues (\w -> -w) m
+    in ZSet negated
+
+--- Abelian group subtraction: A - B = A + (-B).
+subZSets :: Ord a => ZSet a -> ZSet a -> ZSet a
+subZSets zs1 zs2 = addZSets zs1 (negateZSet zs2)
+
+--- Scalar multiplication: (k * A)(x) = k * A(x).
+scaleZSet :: Long -> ZSet a -> ZSet a
+scaleZSet 0L _ = emptyZSet
+scaleZSet 1L zs = zs
+scaleZSet factor (ZSet m) =
+    let scaled = TM.mapValues (\w -> w * factor) m
+    in ZSet scaled
+
+--- Distinct projection: clamps positive weights to 1 and negative weights to 0.
+distinctZSet :: Ord a => ZSet a -> ZSet a
+distinctZSet (ZSet m) =
+    let positiveEntries = [(k, 1L) | (k, w) <- TM.each m, w > 0L]
+    in fromEntries positiveEntries
+
+--- Filter elements in the Z-Set by a predicate.
+filterZSet :: Ord a => (a -> Bool) -> ZSet a -> ZSet a
+filterZSet predicate (ZSet m) =
+    let filtered = TM.filterWithKey (\k _ -> predicate k) m
+    in ZSet filtered
+
+--- Map elements to a new type, combining weights of colliding elements.
+mapZSet :: (Ord a, Ord b) => (a -> b) -> ZSet a -> ZSet b
+mapZSet f (ZSet m) =
+    fold (\acc (k, w) -> insertWeight (f k) w acc) emptyZSet (TM.each m)
+
+--- Monadic bind / flatMap for Z-Sets.
+flatMapZSet :: (Ord a, Ord b) => (a -> ZSet b) -> ZSet a -> ZSet b
+flatMapZSet f (ZSet m) =
+    fold (\acc (k, w) -> addZSets acc (scaleZSet w (f k))) emptyZSet (TM.each m)
+
+--- Convert Z-Set to an association list of (element, weight) pairs.
+toEntries :: ZSet a -> [(a, Long)]
+toEntries (ZSet m) = TM.each m
+
+--- Construct Z-Set from an association list of (element, weight) pairs.
+fromEntries :: Ord a => [(a, Long)] -> ZSet a
+fromEntries entries =
+    fold (\acc (k, w) -> insertWeight k w acc) emptyZSet entries
+
+--- Return the number of distinct elements with non-zero weight.
+zsetSize :: ZSet a -> Int
+zsetSize (ZSet m) = TM.size m
+
+--- Return the sum of all weights across the Z-Set.
+totalWeight :: ZSet a -> Long
+totalWeight (ZSet m) = fold (\acc (_, w) -> acc + w) 0L (TM.each m)
+
+--- Check if the Z-Set is empty (all weights are zero).
+isZSetEmpty :: ZSet a -> Bool
+isZSetEmpty (ZSet m) = TM.size m == 0
