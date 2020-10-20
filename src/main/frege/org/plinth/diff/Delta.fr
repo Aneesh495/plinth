@@ -1,0 +1,122 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.diff.Delta
+    Description: Stream delta events, retraction algebra, and weighted event buffers.
+-}
+
+module org.plinth.diff.Delta where
+
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.vector.VectorBatch
+import org.plinth.diff.ZSet
+
+--- Classification of stream change events.
+data ChangeType =
+      ChangeInsert
+    | ChangeDelete
+    | ChangeUpdateBefore
+    | ChangeUpdateAfter
+
+derive Eq ChangeType
+derive Ord ChangeType
+
+instance Show ChangeType where
+    show ChangeInsert       = "+INSERT"
+    show ChangeDelete       = "-DELETE"
+    show ChangeUpdateBefore = "-UPDATE_OLD"
+    show ChangeUpdateAfter  = "+UPDATE_NEW"
+
+--- A discrete stream event carrying an identifier, timestamp, tuple payload, and integer weight.
+data StreamEvent = StreamEvent {
+    rowId     :: RowId,
+    timestamp :: Timestamp,
+    tuple     :: [Value],
+    weight    :: Long
+}
+
+derive Eq StreamEvent
+derive Ord StreamEvent
+
+instance Show StreamEvent where
+    show ev = "Event(" ++ show ev.rowId ++
+              ", t=" ++ show ev.timestamp ++
+              ", w=" ++ show ev.weight ++
+              ", data=" ++ show ev.tuple ++ ")"
+
+--- Construct an insertion event (weight = +1L).
+insertEvent :: RowId -> Timestamp -> [Value] -> StreamEvent
+insertEvent rid ts vals = StreamEvent rid ts vals 1L
+
+--- Construct a retraction/deletion event (weight = -1L).
+deleteEvent :: RowId -> Timestamp -> [Value] -> StreamEvent
+deleteEvent rid ts vals = StreamEvent rid ts vals (-1L)
+
+--- A collective stream delta represented as a Z-Set over relational tuple values.
+data StreamDelta = StreamDelta {
+    schema       :: Schema,
+    changes      :: ZSet [Value],
+    maxTimestamp :: Timestamp
+}
+
+derive Eq StreamDelta
+derive Ord StreamDelta
+
+instance Show StreamDelta where
+    show sd = "StreamDelta(schema=" ++ show sd.schema ++
+              ", diffs=" ++ show (zsetSize sd.changes) ++
+              ", tMax=" ++ show sd.maxTimestamp ++ ")"
+
+--- Construct an empty stream delta for a given schema.
+emptyDelta :: Schema -> StreamDelta
+emptyDelta s = StreamDelta s emptyZSet epochZero
+
+--- Construct a StreamDelta from a VectorBatch (all rows treated as insertions with weight +1L).
+deltaFromBatch :: VectorBatch -> Timestamp -> StreamDelta
+deltaFromBatch vb ts =
+    let rows = toRows vb
+        zset = fromEntries [(r, 1L) | r <- rows]
+    in StreamDelta vb.schema zset ts
+
+--- Construct a StreamDelta from a list of individual StreamEvents.
+deltaFromEvents :: Schema -> [StreamEvent] -> StreamDelta
+deltaFromEvents s evs =
+    let entries = [(ev.tuple, ev.weight) | ev <- evs]
+        zset    = fromEntries entries
+        maxTs   = if null evs
+                  then epochZero
+                  else maximum (map StreamEvent.timestamp evs)
+    in StreamDelta s zset maxTs
+
+--- Combine two stream deltas sharing the same schema via Abelian group addition.
+combineDeltas :: StreamDelta -> StreamDelta -> StreamDelta
+combineDeltas d1 d2 =
+    let combinedZSet = addZSets d1.changes d2.changes
+        maxTs = max d1.maxTimestamp d2.maxTimestamp
+    in StreamDelta d1.schema combinedZSet maxTs
+
+--- Invert a stream delta: transforms all insertions to retractions and vice versa.
+invertDelta :: StreamDelta -> StreamDelta
+invertDelta sd =
+    StreamDelta sd.schema (negateZSet sd.changes) sd.maxTimestamp
+
+--- Filter tuples in a stream delta by a relational predicate.
+filterDelta :: ([Value] -> Bool) -> StreamDelta -> StreamDelta
+filterDelta predicate sd =
+    StreamDelta sd.schema (filterZSet predicate sd.changes) sd.maxTimestamp
+
+--- Project a subset of column indices from tuples in the stream delta.
+projectDelta :: Schema -> [Int] -> StreamDelta -> StreamDelta
+projectDelta targetSchema colIndices sd =
+    let projTuple t = [t !! idx | idx <- colIndices, idx >= 0, idx < length t]
+        projZSet    = mapZSet projTuple sd.changes
+    in StreamDelta targetSchema projZSet sd.maxTimestamp
+
+--- Check if the stream delta contains zero active changes.
+isDeltaEmpty :: StreamDelta -> Bool
+isDeltaEmpty sd = isZSetEmpty sd.changes
+
+--- Net cardinality change represented by this delta.
+deltaCardinality :: StreamDelta -> Long
+deltaCardinality sd = totalWeight sd.changes
