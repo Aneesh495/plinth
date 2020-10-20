@@ -1,0 +1,167 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.vector.Compression
+    Description: Columnar encodings: Run-Length Encoding (RLE), Dictionary, and Delta compression.
+-}
+
+module org.plinth.vector.Compression where
+
+import frege.data.List
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.common.BitSet
+import org.plinth.vector.ColumnVector
+
+--- Supported columnar compression schemes.
+data CompressionCodec =
+      CodecPlain
+    | CodecRLE
+    | CodecDictionary
+    | CodecDelta
+
+derive Eq CompressionCodec
+derive Ord CompressionCodec
+
+instance Show CompressionCodec where
+    show CodecPlain      = "PLAIN"
+    show CodecRLE        = "RLE"
+    show CodecDictionary = "DICTIONARY"
+    show CodecDelta      = "DELTA"
+
+--- Compressed columnar vector representation.
+data CompressedColumn =
+      CompressedPlain {
+          rawVector :: ColumnVector
+      }
+    | CompressedRLE {
+          dataType :: DataType,
+          runs     :: [(Value, Int)]
+      }
+    | CompressedDict {
+          dataType   :: DataType,
+          dictionary :: [Value],
+          indices    :: [Int]
+      }
+    | CompressedDelta {
+          dataType  :: DataType,
+          baseValue :: Long,
+          deltas    :: [Long]
+      }
+
+derive Eq CompressedColumn
+derive Ord CompressedColumn
+
+instance Show CompressedColumn where
+    show (CompressedPlain cv)      = "Compressed(PLAIN, len=" ++ show (columnVectorLength cv) ++ ")"
+    show (CompressedRLE dt rs)     = "Compressed(RLE, runs=" ++ show (length rs) ++ ")"
+    show (CompressedDict dt d is)  = "Compressed(DICT, dictSize=" ++ show (length d) ++ ", items=" ++ show (length is) ++ ")"
+    show (CompressedDelta dt b ds) = "Compressed(DELTA, base=" ++ show b ++ ", items=" ++ show (length ds) ++ ")"
+
+--- Encode a column vector using Run-Length Encoding (RLE).
+encodeRLE :: ColumnVector -> CompressedColumn
+encodeRLE cv =
+    let vals = toValues cv
+        runs = buildRuns vals
+    in CompressedRLE (columnVectorType cv) runs
+
+--- Helper to group consecutive identical values into run tuples.
+buildRuns :: [Value] -> [(Value, Int)]
+buildRuns [] = []
+buildRuns (x:xs) = go x 1 xs where
+    go cur count [] = [(cur, count)]
+    go cur count (y:ys)
+        | cur == y  = go cur (count + 1) ys
+        | otherwise = (cur, count) : go y 1 ys
+
+--- Encode a column vector using Dictionary Encoding.
+encodeDict :: ColumnVector -> CompressedColumn
+encodeDict cv =
+    let vals = toValues cv
+        dict = nub vals
+        dictMap = zip dict [0..]
+        findIdx v = case find (\(d, _) -> d == v) dictMap of
+            Just (_, idx) -> idx
+            Nothing       -> 0
+        idxList = map findIdx vals
+    in CompressedDict (columnVectorType cv) dict idxList
+
+--- Encode a numeric column vector using Delta Encoding.
+encodeDelta :: ColumnVector -> Maybe CompressedColumn
+encodeDelta cv = case columnVectorType cv of
+    TypeInt64 ->
+        let vals = toValues cv
+            longs = map (`asLong` 0L) vals
+        in buildDelta TypeInt64 longs
+    TypeInt32 ->
+        let vals = toValues cv
+            longs = map (\v -> fromIntegral (asInt v 0) :: Long) vals
+        in buildDelta TypeInt32 longs
+    TypeTimestamp ->
+        let vals = toValues cv
+            extractTs (ValTimestamp (Timestamp t)) = t
+            extractTs _ = 0L
+            longs = map extractTs vals
+        in buildDelta TypeTimestamp longs
+    _ -> Nothing
+  where
+    buildDelta dt [] = Just (CompressedDelta dt 0L [])
+    buildDelta dt (firstVal:rest) =
+        let deltas = computeDeltas firstVal rest
+        in Just (CompressedDelta dt firstVal deltas)
+    computeDeltas _ [] = []
+    computeDeltas prev (x:xs) = (x - prev) : computeDeltas x xs
+
+--- Decompress any CompressedColumn back to a plain ColumnVector.
+decompress :: CompressedColumn -> ColumnVector
+decompress col = case col of
+    CompressedPlain cv -> cv
+    CompressedRLE dt runs ->
+        let expanded = concatMap (\(val, count) -> replicate count val) runs
+        in fromValues dt expanded
+    CompressedDict dt dict idxs ->
+        let restored = map (\i -> if i >= 0 && i < length dict then dict !! i else ValNull) idxs
+        in fromValues dt restored
+    CompressedDelta dt base ds ->
+        let restoredLongs = scanl (+) base ds
+            restoredVals = map (\l -> case dt of
+                TypeInt32     -> ValInt (fromIntegral l)
+                TypeInt64     -> ValLong l
+                TypeTimestamp -> ValTimestamp (Timestamp l)
+                _             -> ValLong l) restoredLongs
+        in fromValues dt restoredVals
+
+--- Decode an RLE compressed column back to a ColumnVector.
+decodeRLE :: CompressedColumn -> ColumnVector
+decodeRLE c = decompress c
+
+--- Decode a Dictionary encoded column back to a ColumnVector.
+decodeDict :: CompressedColumn -> ColumnVector
+decodeDict c = decompress c
+
+--- Decode a Delta encoded column back to a ColumnVector.
+decodeDelta :: CompressedColumn -> ColumnVector
+decodeDelta c = decompress c
+
+--- Automatically select the most compact compression codec for a given vector.
+autoCompress :: ColumnVector -> CompressedColumn
+autoCompress cv
+    | columnVectorLength cv < 8 = CompressedPlain cv
+    | otherwise =
+        let rleComp = encodeRLE cv
+            dictComp = encodeDict cv
+            deltaCompOpt = encodeDelta cv
+            rleSize = case rleComp of
+                CompressedRLE _ rs -> length rs * 2
+                _                  -> 999999
+            dictSize = case dictComp of
+                CompressedDict _ d is -> length d + length is
+                _                     -> 999999
+            rawSize = columnVectorLength cv
+        in if rleSize < dictSize && rleSize < rawSize
+           then rleComp
+           else if dictSize < rawSize
+           then dictComp
+           else case deltaCompOpt of
+               Just dc -> dc
+               Nothing -> CompressedPlain cv
