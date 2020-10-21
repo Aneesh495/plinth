@@ -1,0 +1,99 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.diff.Differential
+    Description: Formal DBSP differential operator calculus for linear and bilinear incremental transformations.
+-}
+
+module org.plinth.diff.Differential where
+
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.diff.ZSet
+import org.plinth.diff.Delta
+
+--- A materialized relational state snapshot accumulating all stream deltas up to a timestamp.
+data StreamSnapshot = StreamSnapshot {
+    schema    :: Schema,
+    relation  :: ZSet [Value],
+    timestamp :: Timestamp
+}
+
+derive Eq StreamSnapshot
+derive Ord StreamSnapshot
+
+instance Show StreamSnapshot where
+    show ss = "Snapshot(schema=" ++ show ss.schema ++
+              ", rows=" ++ show (zsetSize ss.relation) ++
+              ", t=" ++ show ss.timestamp ++ ")"
+
+--- Construct an empty state snapshot.
+emptySnapshot :: Schema -> StreamSnapshot
+emptySnapshot s = StreamSnapshot s emptyZSet epochZero
+
+--- Apply a stream delta to a state snapshot: R_{next} = R_{prev} + Delta.
+applyDelta :: StreamSnapshot -> StreamDelta -> StreamSnapshot
+applyDelta ss sd =
+    let newRelation = addZSets ss.relation sd.changes
+        newTs       = max ss.timestamp sd.maxTimestamp
+    in StreamSnapshot ss.schema newRelation newTs
+
+--- DBSP Linear Operator Property:
+--- For any linear operator L, D(L(s)) = L(D(s)).
+--- Linear operators require zero state retention; the delta propagates directly.
+dLinear :: (ZSet [Value] -> ZSet [Value]) -> StreamDelta -> Schema -> StreamDelta
+dLinear op sd targetSchema =
+    let transformedZSet = op sd.changes
+    in StreamDelta targetSchema transformedZSet sd.maxTimestamp
+
+--- Incremental Selection: sigma(Delta R).
+dFilter :: ([Value] -> Bool) -> StreamDelta -> StreamDelta
+dFilter predicate sd = filterDelta predicate sd
+
+--- Incremental Projection: pi(Delta R).
+dProject :: Schema -> [Int] -> StreamDelta -> StreamDelta
+dProject targetSchema colIndices sd = projectDelta targetSchema colIndices sd
+
+--- Incremental Union: Delta R1 + Delta R2.
+dUnion :: StreamDelta -> StreamDelta -> StreamDelta
+dUnion d1 d2 = combineDeltas d1 d2
+
+--- Incremental Difference: Delta R1 - Delta R2 = Delta R1 + (-Delta R2).
+dDifference :: StreamDelta -> StreamDelta -> StreamDelta
+dDifference d1 d2 = combineDeltas d1 (invertDelta d2)
+
+--- DBSP Bilinear Operator Differential Rule:
+--- For any bilinear operator B (such as Join):
+--- Delta(B(R, S)) = B(Delta R, S_prev) + B(R_new, Delta S)
+--- where R_new = R_prev + Delta R.
+--- This guarantees zero duplicate joins and exact incremental output.
+dBilinear :: (ZSet [Value] -> ZSet [Value] -> ZSet [Value])
+          -> StreamDelta      -- Delta R
+          -> StreamSnapshot   -- R_prev
+          -> StreamDelta      -- Delta S
+          -> StreamSnapshot   -- S_prev
+          -> Schema           -- Output Schema
+          -> StreamDelta
+dBilinear joinFn dR rPrev dS sPrev outSchema =
+    let -- Term 1: B(Delta R, S_prev)
+        term1 = joinFn dR.changes sPrev.relation
+        -- Term 2: R_new = R_prev + Delta R
+        rNewRelation = addZSets rPrev.relation dR.changes
+        -- Term 3: B(R_new, Delta S)
+        term2 = joinFn rNewRelation dS.changes
+        -- Total incremental change = Term 1 + Term 2
+        totalChanges = addZSets term1 term2
+        maxTs = maximum [dR.maxTimestamp, dS.maxTimestamp, rPrev.timestamp, sPrev.timestamp]
+    in StreamDelta outSchema totalChanges maxTs
+
+--- Verification of the Commutative Diagram of Incremental Computation:
+--- Tests that Integral(D(f(s))) == f(Integral(s)) for a sequence of stream deltas.
+verifyCommutativeDiagram :: Ord a => (ZSet a -> ZSet a) -> [ZSet a] -> Bool
+verifyCommutativeDiagram op deltas =
+    let -- Path 1: Integrate deltas first, then apply batch operator Q
+        integratedInput = fold addZSets emptyZSet deltas
+        batchResult = op integratedInput
+        -- Path 2: Apply incremental operator to each delta, then integrate outputs
+        incrementalOutputs = map op deltas
+        integratedIncremental = fold addZSets emptyZSet incrementalOutputs
+    in batchResult == integratedIncremental
