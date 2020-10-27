@@ -1,0 +1,85 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.diff.Integrator
+    Description: Continuous state integration, temporal window eviction, and state compaction.
+-}
+
+module org.plinth.diff.Integrator where
+
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.diff.ZSet
+import org.plinth.diff.Delta
+import org.plinth.diff.Differential
+
+--- A stateful stream integrator accumulating incoming deltas and managing window retention.
+data StateIntegrator = StateIntegrator {
+    schema          :: Schema,
+    currentSnapshot :: StreamSnapshot,
+    deltaCount      :: Long,
+    lastWatermark   :: Watermark
+}
+
+derive Eq StateIntegrator
+derive Ord StateIntegrator
+
+instance Show StateIntegrator where
+    show si = "Integrator(schema=" ++ show si.schema ++
+              ", rows=" ++ show (zsetSize si.currentSnapshot.relation) ++
+              ", deltas=" ++ show si.deltaCount ++
+              ", wm=" ++ show si.lastWatermark ++ ")"
+
+--- Construct a new state integrator for the specified schema.
+makeIntegrator :: Schema -> StateIntegrator
+makeIntegrator s = StateIntegrator s (emptySnapshot s) 0L WatermarkNone
+
+--- Step the integrator forward with an incoming stream delta.
+stepIntegrator :: StateIntegrator -> StreamDelta -> StateIntegrator
+stepIntegrator si delta =
+    let nextSnapshot = applyDelta si.currentSnapshot delta
+        nextCount    = si.deltaCount + 1L
+        nextWm       = advanceWatermark si.lastWatermark delta.maxTimestamp
+    in StateIntegrator si.schema nextSnapshot nextCount nextWm
+
+--- Evict expired tuples older than (watermark - retentionWindow).
+--- Returns the updated integrator and an eviction retraction delta (weights = -1L).
+evictExpired :: StateIntegrator
+             -> Int               -- Column index of event timestamp in tuple
+             -> Duration          -- Retention duration
+             -> (StateIntegrator, StreamDelta)
+evictExpired si tsColIdx (Duration retentionUs) = case si.lastWatermark of
+    WatermarkTime (Timestamp wmUs) ->
+        let cutoffUs = wmUs - retentionUs
+            isExpired tuple =
+                if tsColIdx >= 0 && tsColIdx < length tuple
+                then case tuple !! tsColIdx of
+                    ValTimestamp (Timestamp t) -> t < cutoffUs
+                    ValLong l                  -> l < cutoffUs
+                    _                          -> false
+                else false
+            currentEntries = toEntries si.currentSnapshot.relation
+            expiredEntries = [ (t, w) | (t, w) <- currentEntries, isExpired t, w > 0L ]
+            retractionEntries = [ (t, -w) | (t, w) <- expiredEntries ]
+            retractionDelta = StreamDelta si.schema (fromEntries retractionEntries) (Timestamp wmUs)
+            updatedSnapshot = applyDelta si.currentSnapshot retractionDelta
+        in (StateIntegrator si.schema updatedSnapshot si.deltaCount si.lastWatermark, retractionDelta)
+    _ ->
+        (si, emptyDelta si.schema)
+
+--- Extract the current active positive rows from the integrator.
+queryCurrentRows :: StateIntegrator -> [[Value]]
+queryCurrentRows si =
+    [ t | (t, w) <- toEntries si.currentSnapshot.relation, w > 0L ]
+
+--- Extract the raw accumulated Z-Set from the integrator.
+queryCurrentZSet :: StateIntegrator -> ZSet [Value]
+queryCurrentZSet si = si.currentSnapshot.relation
+
+--- Compact the integrator state by removing any dead entries (zero weights).
+compactState :: StateIntegrator -> StateIntegrator
+compactState si =
+    let activeEntries = [ (t, w) | (t, w) <- toEntries si.currentSnapshot.relation, w /= 0L ]
+        compactedZSet = fromEntries activeEntries
+        compactedSnap = StreamSnapshot si.schema compactedZSet si.currentSnapshot.timestamp
+    in StateIntegrator si.schema compactedSnap si.deltaCount si.lastWatermark
