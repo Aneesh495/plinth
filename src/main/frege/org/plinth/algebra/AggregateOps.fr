@@ -1,0 +1,173 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.algebra.AggregateOps
+    Description: Incremental commutative monoid aggregation: Sum, Count, Avg, Min, and Max.
+-}
+
+module org.plinth.algebra.AggregateOps where
+
+import frege.data.List (nub)
+import frege.data.TreeMap as TM
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.diff.ZSet
+import org.plinth.diff.Delta
+
+--- Supported aggregation functions.
+data AggKind =
+      AggCount
+    | AggSum
+    | AggAvg
+    | AggMin
+    | AggMax
+
+derive Eq AggKind
+derive Ord AggKind
+
+instance Show AggKind where
+    show AggCount = "COUNT"
+    show AggSum   = "SUM"
+    show AggAvg   = "AVG"
+    show AggMin   = "MIN"
+    show AggMax   = "MAX"
+
+--- Specification of an aggregation column in a GROUP BY query.
+data AggSpec = AggSpec {
+    kind       :: AggKind,
+    argColIdx  :: Int,
+    outputName :: String
+}
+
+derive Eq AggSpec
+derive Ord AggSpec
+
+instance Show AggSpec where
+    show spec = show spec.kind ++ "($" ++ show spec.argColIdx ++ ") AS " ++ spec.outputName
+
+--- Internal state maintained for an individual aggregate accumulator.
+data AggAccumulator = AggAccumulator {
+    count     :: Long,
+    sumVal    :: Double,
+    minMaxBag :: TM.TreeMap Value Long
+}
+
+instance Eq AggAccumulator where
+    a1 == a2 = a1.count == a2.count && a1.sumVal == a2.sumVal && TM.each a1.minMaxBag == TM.each a2.minMaxBag
+    hashCode a = hashCode a.count * 31 + hashCode a.sumVal
+
+instance Ord AggAccumulator where
+    a1 <=> a2 = case a1.count <=> a2.count of
+        Eq -> case a1.sumVal <=> a2.sumVal of
+            Eq -> TM.each a1.minMaxBag <=> TM.each a2.minMaxBag
+            other -> other
+        other -> other
+
+instance Show AggAccumulator where
+    show acc = "Accum(cnt=" ++ show acc.count ++ ", sum=" ++ show acc.sumVal ++ ")"
+
+--- Construct an initial empty accumulator.
+emptyAccumulator :: AggAccumulator
+emptyAccumulator = AggAccumulator 0L 0.0 empty
+
+--- Update an accumulator with a scalar value and its delta weight.
+updateAccumulator :: AggKind -> Value -> Long -> AggAccumulator -> AggAccumulator
+updateAccumulator _ ValNull _ acc = acc
+updateAccumulator AggCount _ weight acc =
+    acc.{count = acc.count + weight}
+updateAccumulator AggSum val weight acc =
+    let dblVal = asDouble val 0.0
+        dSum = dblVal * fromIntegral weight
+    in acc.{count = acc.count + weight, sumVal = acc.sumVal + dSum}
+updateAccumulator AggAvg val weight acc =
+    let dblVal = asDouble val 0.0
+        dSum = dblVal * fromIntegral weight
+    in acc.{count = acc.count + weight, sumVal = acc.sumVal + dSum}
+updateAccumulator AggMin val weight acc =
+    let curBag = acc.minMaxBag
+        curCount = case TM.lookup val curBag of
+            Just c  -> c
+            Nothing -> 0L
+        newCount = curCount + weight
+        updatedBag = if newCount <= 0L
+                     then TM.delete val curBag
+                     else TM.insert val newCount curBag
+    in acc.{count = acc.count + weight, minMaxBag = updatedBag}
+updateAccumulator AggMax val weight acc =
+    updateAccumulator AggMin val weight acc
+
+--- Compute the final scalar Value from an accumulator.
+computeAggValue :: AggKind -> AggAccumulator -> Value
+computeAggValue AggCount acc = ValLong acc.count
+computeAggValue AggSum acc
+    | acc.count == 0L = ValNull
+    | otherwise       = ValDouble acc.sumVal
+computeAggValue AggAvg acc
+    | acc.count == 0L = ValNull
+    | otherwise       = ValDouble (acc.sumVal / fromIntegral acc.count)
+computeAggValue AggMin acc = case TM.findMin acc.minMaxBag of
+    Just (minVal, _) -> minVal
+    Nothing          -> ValNull
+computeAggValue AggMax acc = case TM.findMax acc.minMaxBag of
+    Just (maxVal, _) -> maxVal
+    Nothing          -> ValNull
+
+--- Compute the complete aggregate tuple for a group: key ++ [aggValues].
+computeGroupOutput :: [Value] -> [AggSpec] -> [AggAccumulator] -> [Value]
+computeGroupOutput groupKey specs accs =
+    let aggVals = zipWith (\spec acc -> computeAggValue spec.kind acc) specs accs
+    in groupKey ++ aggVals
+
+--- Step an incremental Group-By aggregation over an incoming stream delta.
+--- Returns the updated state map and an emission delta containing retractions of old values
+--- and insertions of new aggregate values.
+stepAggregate :: [Int]                               -- Group key column indices
+              -> [AggSpec]                           -- Aggregation specifications
+              -> Schema                              -- Target output schema
+              -> TM.TreeMap [Value] [AggAccumulator] -- Prior group states
+              -> StreamDelta                         -- Incoming stream delta
+              -> (TM.TreeMap [Value] [AggAccumulator], StreamDelta)
+stepAggregate keyIndices specs outSchema stateMap delta =
+    let entries = toEntries delta.changes
+        -- Process all delta entries and track modified group keys
+        (updatedMap, modifiedKeys) = fold updateEntry (stateMap, []) entries
+        -- Generate retraction of old outputs and insertion of new outputs
+        emissionEvents = concatMap (generateGroupDiff stateMap updatedMap specs) (nub modifiedKeys)
+        emissionDelta  = StreamDelta outSchema (fromEntries emissionEvents) delta.maxTimestamp
+    in (updatedMap, emissionDelta)
+  where
+    extractKey tuple = [tuple !! idx | idx <- keyIndices, idx >= 0, idx < length tuple]
+    
+    updateEntry (curMap, modKeys) (tuple, weight) =
+        let k = extractKey tuple
+            oldAccs = case TM.lookup k curMap of
+                Just accs -> accs
+                Nothing   -> replicate (length specs) emptyAccumulator
+            newAccs = zipWith (\spec acc ->
+                let val = if spec.argColIdx >= 0 && spec.argColIdx < length tuple
+                          then tuple !! spec.argColIdx
+                          else ValNull
+                in updateAccumulator spec.kind val weight acc) specs oldAccs
+            nextMap = if all (\acc -> acc.count <= 0L) newAccs
+                      then TM.delete k curMap
+                      else TM.insert k newAccs curMap
+        in (nextMap, k : modKeys)
+
+    generateGroupDiff oldMap newMap sps k =
+        let oldOutputOpt = case TM.lookup k oldMap of
+                Just accs -> if any (\a -> a.count > 0L) accs
+                             then Just (computeGroupOutput k sps accs)
+                             else Nothing
+                Nothing   -> Nothing
+            newOutputOpt = case TM.lookup k newMap of
+                Just accs -> if any (\a -> a.count > 0L) accs
+                             then Just (computeGroupOutput k sps accs)
+                             else Nothing
+                Nothing   -> Nothing
+        in case (oldOutputOpt, newOutputOpt) of
+            (Just oldRow, Just newRow)
+                | oldRow == newRow -> []
+                | otherwise        -> [(oldRow, -1L), (newRow, 1L)]
+            (Just oldRow, Nothing) -> [(oldRow, -1L)]
+            (Nothing, Just newRow) -> [(newRow, 1L)]
+            (Nothing, Nothing)     -> []
