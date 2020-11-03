@@ -1,0 +1,139 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.algebra.Operator
+    Description: Incremental relational operators: Filter, Project, Union, and Expression evaluation.
+-}
+
+module org.plinth.algebra.Operator where
+
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.diff.ZSet
+import org.plinth.diff.Delta
+import org.plinth.diff.Differential
+
+--- Binary relational expressions and arithmetic operations.
+data BinOp =
+      OpAdd
+    | OpSub
+    | OpMul
+    | OpDiv
+    | OpEq
+    | OpNeq
+    | OpLt
+    | OpLte
+    | OpGt
+    | OpGte
+    | OpAnd
+    | OpOr
+
+derive Eq BinOp
+derive Ord BinOp
+
+instance Show BinOp where
+    show OpAdd = "+"
+    show OpSub = "-"
+    show OpMul = "*"
+    show OpDiv = "/"
+    show OpEq  = "="
+    show OpNeq = "!="
+    show OpLt  = "<"
+    show OpLte = "<="
+    show OpGt  = ">"
+    show OpGte = ">="
+    show OpAnd = "AND"
+    show OpOr  = "OR"
+
+--- Unary operations on scalar expressions.
+data UnOp =
+      OpNot
+    | OpNeg
+
+derive Eq UnOp
+derive Ord UnOp
+
+instance Show UnOp where
+    show OpNot = "NOT"
+    show OpNeg = "-"
+
+--- Scalar relational expression tree.
+data RelExpr =
+      ExprColRef Int
+    | ExprLiteral Value
+    | ExprBinary BinOp RelExpr RelExpr
+    | ExprUnary UnOp RelExpr
+
+derive Eq RelExpr
+derive Ord RelExpr
+
+instance Show RelExpr where
+    show (ExprColRef idx)          = "$" ++ show idx
+    show (ExprLiteral v)           = show v
+    show (ExprBinary op e1 e2)     = "(" ++ show e1 ++ " " ++ show op ++ " " ++ show e2 ++ ")"
+    show (ExprUnary op e)          = show op ++ "(" ++ show e ++ ")"
+
+--- Evaluate a RelExpr against a single tuple row.
+evalExpr :: [Value] -> RelExpr -> Value
+evalExpr tuple (ExprColRef idx)
+    | idx >= 0 && idx < length tuple = tuple !! idx
+    | otherwise                      = ValNull
+evalExpr _ (ExprLiteral v) = v
+evalExpr tuple (ExprUnary OpNot e) = case evalExpr tuple e of
+    ValBool b -> ValBool (not b)
+    _         -> ValNull
+evalExpr tuple (ExprUnary OpNeg e) = valNegate (evalExpr tuple e)
+evalExpr tuple (ExprBinary op e1 e2) =
+    let v1 = evalExpr tuple e1
+        v2 = evalExpr tuple e2
+    in evalBinaryOp op v1 v2
+
+--- Evaluate a binary operator over two scalar values.
+evalBinaryOp :: BinOp -> Value -> Value -> Value
+evalBinaryOp OpAdd v1 v2 = valAdd v1 v2
+evalBinaryOp OpSub v1 v2 = valSub v1 v2
+evalBinaryOp OpMul v1 v2 = valMul v1 v2
+evalBinaryOp OpDiv v1 v2 = valDiv v1 v2
+evalBinaryOp OpEq  v1 v2 = if isNull v1 || isNull v2 then ValNull else ValBool (v1 == v2)
+evalBinaryOp OpNeq v1 v2 = if isNull v1 || isNull v2 then ValNull else ValBool (v1 /= v2)
+evalBinaryOp OpLt  v1 v2 = if isNull v1 || isNull v2 then ValNull else ValBool (v1 < v2)
+evalBinaryOp OpLte v1 v2 = if isNull v1 || isNull v2 then ValNull else ValBool (v1 <= v2)
+evalBinaryOp OpGt  v1 v2 = if isNull v1 || isNull v2 then ValNull else ValBool (v1 > v2)
+evalBinaryOp OpGte v1 v2 = if isNull v1 || isNull v2 then ValNull else ValBool (v1 >= v2)
+evalBinaryOp OpAnd v1 v2 = case (v1, v2) of
+    (ValBool true, ValBool true) -> ValBool true
+    (ValBool false, _)           -> ValBool false
+    (_, ValBool false)           -> ValBool false
+    _                            -> ValNull
+evalBinaryOp OpOr v1 v2 = case (v1, v2) of
+    (ValBool true, _)            -> ValBool true
+    (_, ValBool true)            -> ValBool true
+    (ValBool false, ValBool false)-> ValBool false
+    _                            -> ValNull
+
+--- Evaluate a relational expression as a boolean filter predicate.
+evalPredicate :: [Value] -> RelExpr -> Bool
+evalPredicate tuple expr = case evalExpr tuple expr of
+    ValBool true -> true
+    _            -> false
+
+--- Step an incremental Selection operator over an input delta: sigma_{pred}(Delta R).
+stepFilter :: RelExpr -> StreamDelta -> StreamDelta
+stepFilter predExpr sd =
+    let predicate tuple = evalPredicate tuple predExpr
+    in filterDelta predicate sd
+
+--- Step an incremental Projection operator over an input delta: pi_{exprs}(Delta R).
+stepProject :: [RelExpr] -> Schema -> StreamDelta -> StreamDelta
+stepProject exprs targetSchema sd =
+    let projectRow tuple = [evalExpr tuple e | e <- exprs]
+        projectedZSet   = mapZSet projectRow sd.changes
+    in StreamDelta targetSchema projectedZSet sd.maxTimestamp
+
+--- Step an incremental Union operator: Delta R1 + Delta R2.
+stepUnion :: StreamDelta -> StreamDelta -> StreamDelta
+stepUnion d1 d2 = combineDeltas d1 d2
+
+--- Step an incremental Difference operator: Delta R1 - Delta R2.
+stepDifference :: StreamDelta -> StreamDelta -> StreamDelta
+stepDifference d1 d2 = dDifference d1 d2
