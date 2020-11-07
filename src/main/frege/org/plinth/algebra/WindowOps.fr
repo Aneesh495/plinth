@@ -1,0 +1,115 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.algebra.WindowOps
+    Description: Temporal stream windowing: Tumbling, Hopping, and Session windows with watermarks.
+-}
+
+module org.plinth.algebra.WindowOps where
+
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.diff.ZSet
+import org.plinth.diff.Delta
+
+--- Supported temporal streaming window strategies.
+data WindowType =
+      TumblingWindow { size :: Duration }
+    | HoppingWindow  { slide :: Duration, size :: Duration }
+    | SessionWindow  { gap :: Duration }
+
+derive Eq WindowType
+derive Ord WindowType
+
+instance Show WindowType where
+    show (TumblingWindow s)  = "TUMBLE(size=" ++ show s ++ ")"
+    show (HoppingWindow s l) = "HOP(slide=" ++ show s ++ ", size=" ++ show l ++ ")"
+    show (SessionWindow g)   = "SESSION(gap=" ++ show g ++ ")"
+
+--- A bounded continuous time window with inclusive start and exclusive end timestamps.
+data TimeWindow = TimeWindow {
+    windowStart :: Timestamp,
+    windowEnd   :: Timestamp
+}
+
+derive Eq TimeWindow
+derive Ord TimeWindow
+
+instance Show TimeWindow where
+    show w = "[" ++ show w.windowStart ++ ", " ++ show w.windowEnd ++ ")"
+
+--- Check whether an event timestamp falls inside the window bounds.
+isInWindow :: Timestamp -> TimeWindow -> Bool
+isInWindow (Timestamp t) w =
+    let (Timestamp s) = w.windowStart
+        (Timestamp e) = w.windowEnd
+    in t >= s && t < e
+
+--- Assign a timestamp to its corresponding Tumbling Window.
+assignTumblingWindow :: Timestamp -> Duration -> TimeWindow
+assignTumblingWindow (Timestamp t) (Duration sz) =
+    let startUs = (t `div` sz) * sz
+        endUs   = startUs + sz
+    in TimeWindow (Timestamp startUs) (Timestamp endUs)
+
+--- Assign a timestamp to all overlapping Hopping (Sliding) Windows.
+assignHoppingWindows :: Timestamp -> Duration -> Duration -> [TimeWindow]
+assignHoppingWindows (Timestamp t) (Duration slideUs) (Duration sizeUs) =
+    let lastStartUs = (t `div` slideUs) * slideUs
+        firstStartUs = max 0L (lastStartUs - sizeUs + slideUs)
+        starts = [s | s <- [firstStartUs, firstStartUs + slideUs .. lastStartUs], t < s + sizeUs]
+    in [TimeWindow (Timestamp s) (Timestamp (s + sizeUs)) | s <- starts]
+
+--- Assign windows according to the specified WindowType strategy.
+assignWindows :: WindowType -> Timestamp -> [TimeWindow]
+assignWindows (TumblingWindow sz) ts     = [assignTumblingWindow ts sz]
+assignWindows (HoppingWindow sl sz) ts   = assignHoppingWindows ts sl sz
+assignWindows (SessionWindow (Duration gapUs)) (Timestamp t) =
+    -- Individual event initially spans [t, t + gapUs)
+    [TimeWindow (Timestamp t) (Timestamp (t + gapUs))]
+
+--- Step a window assigner over a stream delta, augmenting each tuple with window_start and window_end.
+stepWindowAssigner :: WindowType
+                   -> Int         -- Column index of event timestamp
+                   -> Schema      -- Output schema with appended window columns
+                   -> StreamDelta
+                   -> StreamDelta
+stepWindowAssigner winType tsColIdx outSchema delta =
+    let entries = toEntries delta.changes
+        expandEntry (tuple, weight) =
+            let ts = if tsColIdx >= 0 && tsColIdx < length tuple
+                     then case tuple !! tsColIdx of
+                         ValTimestamp t -> t
+                         ValLong l      -> Timestamp l
+                         _              -> epochZero
+                     else epochZero
+                wins = assignWindows winType ts
+            in [ (tuple ++ [ValTimestamp w.windowStart, ValTimestamp w.windowEnd], weight) | w <- wins ]
+        newEntries = concatMap expandEntry entries
+    in StreamDelta outSchema (fromEntries newEntries) delta.maxTimestamp
+
+--- Active window buffer accumulating events until the watermark passes windowEnd.
+data WindowBuffer = WindowBuffer {
+    window       :: TimeWindow,
+    events       :: ZSet [Value],
+    maxWatermark :: Watermark
+}
+
+derive Eq WindowBuffer
+derive Ord WindowBuffer
+
+instance Show WindowBuffer where
+    show wb = "WindowBuffer(win=" ++ show wb.window ++
+              ", events=" ++ show (zsetSize wb.events) ++ ")"
+
+--- Create an empty window buffer.
+makeWindowBuffer :: TimeWindow -> WindowBuffer
+makeWindowBuffer win = WindowBuffer win emptyZSet WatermarkNone
+
+--- Check whether the window buffer is ready to be finalized based on watermark progression.
+isWindowFinalized :: Watermark -> WindowBuffer -> Bool
+isWindowFinalized WatermarkNone _ = false
+isWindowFinalized WatermarkInfinity _ = true
+isWindowFinalized (WatermarkTime (Timestamp wm)) wb =
+    let (Timestamp endUs) = wb.window.windowEnd
+    in wm >= endUs
