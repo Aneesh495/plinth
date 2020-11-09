@@ -1,0 +1,116 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.algebra.JoinOps
+    Description: Differential equi-join with bilinear delta propagation and stateful index maintenance.
+-}
+
+module org.plinth.algebra.JoinOps where
+
+import frege.data.TreeMap as TM
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.diff.ZSet
+import org.plinth.diff.Delta
+
+--- Supported relational join types for continuous streams.
+data JoinType =
+      JoinInner
+    | JoinLeft
+    | JoinRight
+    | JoinFull
+    | JoinSemi
+    | JoinAnti
+
+derive Eq JoinType
+derive Ord JoinType
+
+instance Show JoinType where
+    show JoinInner = "INNER JOIN"
+    show JoinLeft  = "LEFT OUTER JOIN"
+    show JoinRight = "RIGHT OUTER JOIN"
+    show JoinFull  = "FULL OUTER JOIN"
+    show JoinSemi  = "SEMI JOIN"
+    show JoinAnti  = "ANTI JOIN"
+
+--- Stateful equi-join state indexing both left and right relations by join key.
+data JoinState = JoinState {
+    leftKeyIdx  :: Int,
+    rightKeyIdx :: Int,
+    leftIndex   :: TM.TreeMap Value (ZSet [Value]),
+    rightIndex  :: TM.TreeMap Value (ZSet [Value])
+}
+
+--- Construct an empty initial JoinState with specified join key column indices.
+makeJoinState :: Int -> Int -> JoinState
+makeJoinState lIdx rIdx = JoinState lIdx rIdx empty empty
+
+--- Index a stream delta into a key-partitioned Z-Set map.
+updateJoinIndex :: Int -> StreamDelta -> TM.TreeMap Value (ZSet [Value]) -> TM.TreeMap Value (ZSet [Value])
+updateJoinIndex keyColIdx delta indexMap =
+    fold updateEntry indexMap (toEntries delta.changes)
+  where
+    extractKey tuple =
+        if keyColIdx >= 0 && keyColIdx < length tuple
+        then tuple !! keyColIdx
+        else ValNull
+
+    updateEntry curMap (tuple, weight) =
+        let k = extractKey tuple
+            curZSet = case TM.lookup k curMap of
+                Just zs -> zs
+                Nothing -> emptyZSet
+            nextZSet = insertWeight tuple weight curZSet
+        in if isZSetEmpty nextZSet
+           then TM.delete k curMap
+           else TM.insert k nextZSet curMap
+
+--- Probe an index map with a stream delta to generate join output entries.
+probeIndex :: Int                                     -- Join key column index of delta
+           -> StreamDelta                             -- Probing stream delta
+           -> TM.TreeMap Value (ZSet [Value])         -- Target side indexed state
+           -> Bool                                    -- True if delta is Left side, False if Right
+           -> [( [Value], Long )]
+probeIndex keyColIdx delta targetIndex isDeltaLeft =
+    concatMap probeEntry (toEntries delta.changes)
+  where
+    extractKey tuple =
+        if keyColIdx >= 0 && keyColIdx < length tuple
+        then tuple !! keyColIdx
+        else ValNull
+
+    probeEntry (tuple, weight) =
+        let k = extractKey tuple
+        in case TM.lookup k targetIndex of
+            Nothing       -> []
+            Just matchSet ->
+                [ (combineTuples tuple matchTuple, weight * matchWeight)
+                | (matchTuple, matchWeight) <- toEntries matchSet ]
+
+    combineTuples t1 t2 =
+        if isDeltaLeft
+        then t1 ++ t2
+        else t2 ++ t1
+
+--- Step a differential equi-join over two incoming stream deltas:
+--- Delta(R JOIN S) = (Delta R JOIN S_prev) + (R_new JOIN Delta S)
+--- where R_new = R_prev + Delta R.
+stepDifferentialJoin :: JoinState
+                     -> Schema       -- Joined output schema (leftSchema ++ rightSchema)
+                     -> StreamDelta  -- Delta R (left delta)
+                     -> StreamDelta  -- Delta S (right delta)
+                     -> (JoinState, StreamDelta)
+stepDifferentialJoin state outSchema dR dS =
+    let -- Term 1: Delta R probe against S_prev
+        term1Entries = probeIndex state.leftKeyIdx dR state.rightIndex true
+        -- Update Left index with Delta R: R_new = R_prev + Delta R
+        updatedLeftIndex = updateJoinIndex state.leftKeyIdx dR state.leftIndex
+        -- Term 2: Delta S probe against R_new
+        term2Entries = probeIndex state.rightKeyIdx dS updatedLeftIndex false
+        -- Update Right index with Delta S: S_new = S_prev + Delta S
+        updatedRightIndex = updateJoinIndex state.rightKeyIdx dS state.rightIndex
+        -- Combine all joined delta entries
+        totalZSet = fromEntries (term1Entries ++ term2Entries)
+        maxTs = maximum [dR.maxTimestamp, dS.maxTimestamp]
+        nextState = JoinState state.leftKeyIdx state.rightKeyIdx updatedLeftIndex updatedRightIndex
+    in (nextState, StreamDelta outSchema totalZSet maxTs)
