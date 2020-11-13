@@ -1,0 +1,184 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.sql.Token
+    Description: SQL lexical tokens, keywords, literal representations, and source position tracking.
+-}
+
+module org.plinth.sql.Token where
+
+--- Source file position tracking line and column numbers.
+data SourcePos = SourcePos {
+    line   :: Int,
+    column :: Int
+}
+
+derive Eq SourcePos
+derive Ord SourcePos
+
+instance Show SourcePos where
+    show pos = show pos.line ++ ":" ++ show pos.column
+
+--- Initial source position at start of file.
+initialPos :: SourcePos
+initialPos = SourcePos 1 1
+
+--- Advance position across a single character.
+advancePos :: Char -> SourcePos -> SourcePos
+advancePos '\n' (SourcePos l _) = SourcePos (l + 1) 1
+advancePos '\t' (SourcePos l c) = SourcePos l (((c + 3) `div` 4) * 4 + 1)
+advancePos _    (SourcePos l c) = SourcePos l (c + 1)
+
+--- Lexical token classification for streaming SQL and DDL commands.
+data TokenKind =
+      -- Literals and Identifiers
+      TokIdent String
+    | TokInt Long
+    | TokFloat Double
+    | TokString String
+      -- Streaming Keywords
+    | KwSelect
+    | KwFrom
+    | KwWhere
+    | KwJoin
+    | KwInner
+    | KwLeft
+    | KwRight
+    | KwFull
+    | KwOn
+    | KwGroup
+    | KwBy
+    | KwHaving
+    | KwWindow
+    | KwTumble
+    | KwHop
+    | KwSession
+    | KwWatermark
+    | KwCreate
+    | KwStream
+    | KwMaterialized
+    | KwView
+    | KwTable
+    | KwInsert
+    | KwInto
+    | KwValues
+    | KwEmit
+    | KwChanges
+    | KwAs
+    | KwAnd
+    | KwOr
+    | KwNot
+    | KwIs
+    | KwNull
+    | KwTrue
+    | KwFalse
+    | KwBetween
+    | KwIn
+    | KwOrder
+    | KwAsc
+    | KwDesc
+    | KwLimit
+    | KwWithin
+    | KwPattern
+      -- Punctuation and Operators
+    | TokComma
+    | TokSemicolon
+    | TokDot
+    | TokLParen
+    | TokRParen
+    | TokLBracket
+    | TokRBracket
+    | TokPlus
+    | TokMinus
+    | TokStar
+    | TokSlash
+    | TokEq
+    | TokNeq
+    | TokLt
+    | TokLte
+    | TokGt
+    | TokGte
+    | TokArrow
+    | TokEOF
+
+derive Eq TokenKind
+derive Ord TokenKind
+
+instance Show TokenKind where
+    show (TokIdent s)  = "IDENT(" ++ s ++ ")"
+    show (TokInt i)    = "INT(" ++ show i ++ ")"
+    show (TokFloat f)  = "FLOAT(" ++ show f ++ ")"
+    show (TokString s) = "STRING('" ++ s ++ "')"
+    show KwSelect      = "SELECT"
+    show KwFrom        = "FROM"
+    show KwWhere       = "WHERE"
+    show KwJoin        = "JOIN"
+    show KwInner       = "INNER"
+    show KwLeft        = "LEFT"
+    show KwRight       = "RIGHT"
+    show KwFull        = "FULL"
+    show KwOn          = "ON"
+    show KwGroup       = "GROUP"
+    show KwBy          = "BY"
+    show KwHaving      = "HAVING"
+    show KwWindow      = "WINDOW"
+    show KwTumble      = "TUMBLE"
+    show KwHop         = "HOP"
+    show KwSession     = "SESSION"
+    show KwWatermark   = "WATERMARK"
+    show KwCreate      = "CREATE"
+    show KwStream      = "STREAM"
+    show KwMaterialized = "MATERIALIZED"
+    show KwView        = "VIEW"
+    show KwTable       = "TABLE"
+    show KwInsert      = "INSERT"
+    show KwInto        = "INTO"
+    show KwValues      = "VALUES"
+    show KwEmit        = "EMIT"
+    show KwChanges     = "CHANGES"
+    show KwAs          = "AS"
+    show KwAnd         = "AND"
+    show KwOr          = "OR"
+    show KwNot         = "NOT"
+    show KwIs          = "IS"
+    show KwNull        = "NULL"
+    show KwTrue        = "TRUE"
+    show KwFalse       = "FALSE"
+    show KwBetween     = "BETWEEN"
+    show KwIn          = "IN"
+    show KwOrder       = "ORDER"
+    show KwAsc         = "ASC"
+    show KwDesc        = "DESC"
+    show KwLimit       = "LIMIT"
+    show KwWithin      = "WITHIN"
+    show KwPattern     = "PATTERN"
+    show TokComma      = ","
+    show TokSemicolon  = ";"
+    show TokDot        = "."
+    show TokLParen     = "("
+    show TokRParen     = ")"
+    show TokLBracket   = "["
+    show TokRBracket   = "]"
+    show TokPlus       = "+"
+    show TokMinus      = "-"
+    show TokStar       = "*"
+    show TokSlash      = "/"
+    show TokEq         = "="
+    show TokNeq        = "!="
+    show TokLt         = "<"
+    show TokLte        = "<="
+    show TokGt         = ">"
+    show TokGte        = ">="
+    show TokArrow      = "->"
+    show TokEOF        = "<EOF>"
+
+--- A positioned token in the SQL input stream.
+data Token = Token {
+    kind :: TokenKind,
+    pos  :: SourcePos
+}
+
+derive Eq Token
+derive Ord Token
+
+instance Show Token where
+    show tok = show tok.kind ++ "@" ++ show tok.pos
