@@ -1,0 +1,167 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.sql.Lexer
+    Description: Pure functional streaming SQL tokenizer with comments and string escape handling.
+-}
+
+module org.plinth.sql.Lexer where
+
+import frege.data.Char (isSpace, isDigit, isAlpha, isAlphaNum, toLower)
+import org.plinth.sql.Token
+
+--- Tokenize a raw SQL input query string into a sequence of positioned tokens.
+tokenize :: String -> Either String [Token]
+tokenize input = scanLoop (toList input) initialPos
+  where
+    scanLoop [] pos = Right [Token TokEOF pos]
+    scanLoop (c:cs) pos
+        -- Whitespace
+        | isSpace c = scanLoop cs (advancePos pos c)
+        -- Single-line comments starting with --
+        | c == '-' && not (null cs) && head cs == '-' =
+            let rest = dropWhile (/= '\n') cs
+                consumed = take (length cs - length rest + 1) ('-':cs)
+                newPos = fold advancePos pos consumed
+            in scanLoop rest newPos
+        -- Multi-character operators
+        | c == '<' && not (null cs) && head cs == '=' =
+            emit2 TokLte cs pos '<' '='
+        | c == '<' && not (null cs) && head cs == '>' =
+            emit2 TokNeq cs pos '<' '>'
+        | c == '>' && not (null cs) && head cs == '=' =
+            emit2 TokGte cs pos '>' '='
+        | c == '!' && not (null cs) && head cs == '=' =
+            emit2 TokNeq cs pos '!' '='
+        | c == '-' && not (null cs) && head cs == '>' =
+            emit2 TokArrow cs pos '-' '>'
+        -- Single-character operators
+        | c == '+'  = emit1 TokPlus cs pos c
+        | c == '-'  = emit1 TokMinus cs pos c
+        | c == '*'  = emit1 TokStar cs pos c
+        | c == '/'  = emit1 TokSlash cs pos c
+        | c == '='  = emit1 TokEq cs pos c
+        | c == '<'  = emit1 TokLt cs pos c
+        | c == '>'  = emit1 TokGt cs pos c
+        | c == ','  = emit1 TokComma cs pos c
+        | c == ';'  = emit1 TokSemicolon cs pos c
+        | c == '.'  = emit1 TokDot cs pos c
+        | c == '('  = emit1 TokLParen cs pos c
+        | c == ')'  = emit1 TokRParen cs pos c
+        | c == '['  = emit1 TokLBracket cs pos c
+        | c == ']'  = emit1 TokRBracket cs pos c
+        -- String literal
+        | c == '\'' = scanString cs (advancePos pos '\'') []
+        -- Numeric literal
+        | isDigit c = scanNumber (c:cs) pos
+        -- Identifier or keyword
+        | isAlpha c || c == '_' = scanIdentifier (c:cs) pos
+        | otherwise = Left ("Unexpected character at " ++ show pos)
+
+    emit1 kind rest pos ch =
+        let nextPos = advancePos pos ch
+        in case scanLoop rest nextPos of
+            Right toks -> Right (Token kind pos : toks)
+            Left err   -> Left err
+
+    emit2 kind rest pos c1 c2 =
+        let nextPos = advancePos (advancePos pos c1) c2
+            remCs   = tail rest
+        in case scanLoop remCs nextPos of
+            Right toks -> Right (Token kind pos : toks)
+            Left err   -> Left err
+
+    scanString [] pos _ = Left ("Unterminated string literal at " ++ show pos)
+    scanString ('\'':'\'':rest) pos acc =
+        let nextPos = advancePos (advancePos pos '\'') '\''
+        in scanString rest nextPos ('\'' : acc)
+    scanString ('\'':rest) pos acc =
+        let nextPos = advancePos pos '\''
+            strVal = packed (reverse acc)
+        in case scanLoop rest nextPos of
+            Right toks -> Right (Token (TokString strVal) pos : toks)
+            Left err   -> Left err
+    scanString (ch:rest) pos acc =
+        scanString rest (advancePos pos ch) (ch : acc)
+
+    scanNumber chars pos =
+        let (digits, rest1) = span isDigit chars
+            numStr1 = packed digits
+            posAfterInt = fold advancePos pos digits
+        in if not (null rest1) && head rest1 == '.' && not (null (tail rest1)) && isDigit (head (tail rest1))
+           then
+               let fracChars = drop 1 rest1
+                   (fracDigits, rest2) = span isDigit fracChars
+                   fullFloatStr = numStr1 ++ "." ++ packed fracDigits
+                   posAfterDot = advancePos posAfterInt '.'
+                   posAfterFloat = fold advancePos posAfterDot fracDigits
+                   dblVal = case fullFloatStr.double of
+                       Right d -> d
+                       Left _  -> 0.0
+               in case scanLoop rest2 posAfterFloat of
+                   Right toks -> Right (Token (TokFloat dblVal) pos : toks)
+                   Left err   -> Left err
+           else
+               let longVal = case numStr1.long of
+                       Right l -> l
+                       Left _  -> 0L
+               in case scanLoop rest1 posAfterInt of
+                   Right toks -> Right (Token (TokInt longVal) pos : toks)
+                   Left err   -> Left err
+
+    scanIdentifier chars pos =
+        let isIdentChar ch = isAlphaNum ch || ch == '_'
+            (identChars, rest) = span isIdentChar chars
+            identStr = packed identChars
+            newPos = fold advancePos pos identChars
+            kind = resolveKeyword identStr
+        in case scanLoop rest newPos of
+            Right toks -> Right (Token kind pos : toks)
+            Left err   -> Left err
+
+--- Map identifier string (case-insensitively) to specific keyword TokenKind.
+resolveKeyword :: String -> TokenKind
+resolveKeyword s = case s.toLowerCase of
+    "select"       -> KwSelect
+    "from"         -> KwFrom
+    "where"        -> KwWhere
+    "join"         -> KwJoin
+    "inner"        -> KwInner
+    "left"         -> KwLeft
+    "right"        -> KwRight
+    "full"         -> KwFull
+    "on"           -> KwOn
+    "group"        -> KwGroup
+    "by"           -> KwBy
+    "having"       -> KwHaving
+    "window"       -> KwWindow
+    "tumble"       -> KwTumble
+    "hop"          -> KwHop
+    "session"      -> KwSession
+    "watermark"    -> KwWatermark
+    "create"       -> KwCreate
+    "stream"       -> KwStream
+    "materialized" -> KwMaterialized
+    "view"         -> KwView
+    "table"        -> KwTable
+    "insert"       -> KwInsert
+    "into"         -> KwInto
+    "values"       -> KwValues
+    "emit"         -> KwEmit
+    "changes"      -> KwChanges
+    "as"           -> KwAs
+    "and"          -> KwAnd
+    "or"           -> KwOr
+    "not"          -> KwNot
+    "is"           -> KwIs
+    "null"         -> KwNull
+    "true"         -> KwTrue
+    "false"        -> KwFalse
+    "between"      -> KwBetween
+    "in"           -> KwIn
+    "order"        -> KwOrder
+    "asc"          -> KwAsc
+    "desc"         -> KwDesc
+    "limit"        -> KwLimit
+    "within"       -> KwWithin
+    "pattern"      -> KwPattern
+    _              -> TokIdent s
