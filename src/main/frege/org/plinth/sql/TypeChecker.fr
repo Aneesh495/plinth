@@ -1,0 +1,183 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.sql.TypeChecker
+    Description: Semantic analysis, stream catalog resolution, and expression type derivation.
+-}
+
+module org.plinth.sql.TypeChecker where
+
+import frege.data.TreeMap as TM
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.algebra.Operator
+import org.plinth.algebra.JoinOps
+import org.plinth.algebra.WindowOps
+import org.plinth.sql.AST
+
+--- Metadata catalog mapping stream and view identifiers to relational schemas.
+data Catalog = Catalog {
+    tables :: TM.TreeMap String Schema
+}
+
+instance Eq Catalog where
+    c1 == c2 = TM.each c1.tables == TM.each c2.tables
+    hashCode c = hashCode (TM.each c.tables)
+
+instance Ord Catalog where
+    c1 <=> c2 = TM.each c1.tables <=> TM.each c2.tables
+
+instance Show Catalog where
+    show cat = "Catalog(tables=" ++ show (TM.keys cat.tables) ++ ")"
+
+--- Construct an empty catalog.
+emptyCatalog :: Catalog
+emptyCatalog = Catalog empty
+
+--- Register a stream schema in the catalog.
+registerStream :: String -> Schema -> Catalog -> Catalog
+registerStream name s cat = Catalog (TM.insert name s cat.tables)
+
+--- Look up a stream schema by name.
+lookupStream :: String -> Catalog -> Maybe Schema
+lookupStream name cat = TM.lookup name cat.tables
+
+--- Typed relational expression binding a RelExpr to its inferred DataType.
+data TypedExpr = TypedExpr {
+    expr     :: RelExpr,
+    dataType :: DataType
+}
+
+derive Eq TypedExpr
+derive Ord TypedExpr
+
+instance Show TypedExpr where
+    show te = show te.expr ++ " : " ++ show te.dataType
+
+--- Type-check and resolve an AST SqlExpr against an active input schema.
+typeCheckExpr :: Schema -> SqlExpr -> Either String TypedExpr
+typeCheckExpr schema (SqlLit v) = case valueType v of
+    Just dt -> Right (TypedExpr (ExprLiteral v) dt)
+    Nothing -> Right (TypedExpr (ExprLiteral ValNull) TypeInt32)
+
+typeCheckExpr schema (SqlCol colName _) = case findField colName schema of
+    Just (idx, field) -> Right (TypedExpr (ExprColRef idx) field.dataType)
+    Nothing           -> Left ("Column '" ++ colName ++ "' not found in schema " ++ show (fieldNames schema))
+
+typeCheckExpr schema (SqlUnOp op inner) = do
+    typedInner <- typeCheckExpr schema inner
+    case (op, typedInner.dataType) of
+        (OpNot, TypeBool) -> Right (TypedExpr (ExprUnary OpNot typedInner.expr) TypeBool)
+        (OpNot, other)    -> Left ("NOT operator requires BOOLEAN, but found " ++ show other)
+        (OpNeg, dt)
+            | dt == TypeInt32 || dt == TypeInt64 || dt == TypeFloat64 ->
+                Right (TypedExpr (ExprUnary OpNeg typedInner.expr) dt)
+            | otherwise -> Left ("Unary negation requires numeric type, but found " ++ show dt)
+
+typeCheckExpr schema (SqlBinOp op left right) = do
+    typedLeft  <- typeCheckExpr schema left
+    typedRight <- typeCheckExpr schema right
+    let dtL = typedLeft.dataType
+        dtR = typedRight.dataType
+    case op of
+        -- Arithmetic
+        OpAdd | isNumeric dtL && isNumeric dtR ->
+            let resType = unifyNumeric dtL dtR
+            in Right (TypedExpr (ExprBinary OpAdd typedLeft.expr typedRight.expr) resType)
+        OpSub | isNumeric dtL && isNumeric dtR ->
+            let resType = unifyNumeric dtL dtR
+            in Right (TypedExpr (ExprBinary OpSub typedLeft.expr typedRight.expr) resType)
+        OpMul | isNumeric dtL && isNumeric dtR ->
+            let resType = unifyNumeric dtL dtR
+            in Right (TypedExpr (ExprBinary OpMul typedLeft.expr typedRight.expr) resType)
+        OpDiv | isNumeric dtL && isNumeric dtR ->
+            Right (TypedExpr (ExprBinary OpDiv typedLeft.expr typedRight.expr) TypeFloat64)
+        -- Comparison
+        OpEq  | dtL == dtR || (isNumeric dtL && isNumeric dtR) ->
+            Right (TypedExpr (ExprBinary OpEq typedLeft.expr typedRight.expr) TypeBool)
+        OpNeq | dtL == dtR || (isNumeric dtL && isNumeric dtR) ->
+            Right (TypedExpr (ExprBinary OpNeq typedLeft.expr typedRight.expr) TypeBool)
+        OpLt  | dtL == dtR || (isNumeric dtL && isNumeric dtR) ->
+            Right (TypedExpr (ExprBinary OpLt typedLeft.expr typedRight.expr) TypeBool)
+        OpLte | dtL == dtR || (isNumeric dtL && isNumeric dtR) ->
+            Right (TypedExpr (ExprBinary OpLte typedLeft.expr typedRight.expr) TypeBool)
+        OpGt  | dtL == dtR || (isNumeric dtL && isNumeric dtR) ->
+            Right (TypedExpr (ExprBinary OpGt typedLeft.expr typedRight.expr) TypeBool)
+        OpGte | dtL == dtR || (isNumeric dtL && isNumeric dtR) ->
+            Right (TypedExpr (ExprBinary OpGte typedLeft.expr typedRight.expr) TypeBool)
+        -- Logical
+        OpAnd | dtL == TypeBool && dtR == TypeBool ->
+            Right (TypedExpr (ExprBinary OpAnd typedLeft.expr typedRight.expr) TypeBool)
+        OpOr  | dtL == TypeBool && dtR == TypeBool ->
+            Right (TypedExpr (ExprBinary OpOr typedLeft.expr typedRight.expr) TypeBool)
+        _ -> Left ("Type mismatch for operator " ++ show op ++ " with operands (" ++ show dtL ++ ", " ++ show dtR ++ ")")
+
+typeCheckExpr schema (SqlIsNull inner) = do
+    typedInner <- typeCheckExpr schema inner
+    Right (TypedExpr (ExprBinary OpEq typedInner.expr (ExprLiteral ValNull)) TypeBool)
+
+typeCheckExpr schema (SqlIsNotNull inner) = do
+    typedInner <- typeCheckExpr schema inner
+    Right (TypedExpr (ExprBinary OpNeq typedInner.expr (ExprLiteral ValNull)) TypeBool)
+
+typeCheckExpr schema (SqlBetween inner low high) = do
+    typedInner <- typeCheckExpr schema inner
+    typedLow   <- typeCheckExpr schema low
+    typedHigh  <- typeCheckExpr schema high
+    let geExpr = ExprBinary OpGte typedInner.expr typedLow.expr
+        leExpr = ExprBinary OpLte typedInner.expr typedHigh.expr
+    Right (TypedExpr (ExprBinary OpAnd geExpr leExpr) TypeBool)
+
+typeCheckExpr schema (SqlInList inner targets) = do
+    typedInner <- typeCheckExpr schema inner
+    typedTargets <- mapM (typeCheckExpr schema) targets
+    let eqExprs = [ExprBinary OpEq typedInner.expr t.expr | t <- typedTargets]
+        combinedOr = foldr1 (ExprBinary OpOr) eqExprs
+    Right (TypedExpr combinedOr TypeBool)
+
+typeCheckExpr _ other = Left ("Unsupported expression in scalar type-check: " ++ show other)
+
+--- Check if data type is numeric.
+isNumeric :: DataType -> Bool
+isNumeric TypeInt32   = true
+isNumeric TypeInt64   = true
+isNumeric TypeFloat64 = true
+isNumeric _           = false
+
+--- Unify two numeric types to wider common representation.
+unifyNumeric :: DataType -> DataType -> DataType
+unifyNumeric TypeFloat64 _           = TypeFloat64
+unifyNumeric _ TypeFloat64           = TypeFloat64
+unifyNumeric TypeInt64 _             = TypeInt64
+unifyNumeric _ TypeInt64             = TypeInt64
+unifyNumeric TypeInt32 TypeInt32     = TypeInt32
+unifyNumeric def _                   = def
+
+--- Derive output schema for a TableSource.
+resolveSourceSchema :: Catalog -> TableSource -> Either String Schema
+resolveSourceSchema cat (SourceStream name _) = case lookupStream name cat of
+    Just s  -> Right s
+    Nothing -> Left ("Stream '" ++ name ++ "' does not exist in catalog")
+
+resolveSourceSchema cat (SourceJoin _ left right onCond) = do
+    leftSchema  <- resolveSourceSchema cat left
+    rightSchema <- resolveSourceSchema cat right
+    let merged = mergeSchemas leftSchema rightSchema
+    -- Type-check join ON predicate against merged schema
+    typedCond <- typeCheckExpr merged onCond
+    if typedCond.dataType == TypeBool
+    then Right merged
+    else Left ("JOIN ON condition must evaluate to BOOLEAN, but found " ++ show typedCond.dataType)
+
+resolveSourceSchema cat (SourceWindow src ws) = do
+    baseSchema <- resolveSourceSchema cat src
+    case findField ws.timeCol baseSchema of
+        Nothing -> Left ("Window time column '" ++ ws.timeCol ++ "' not found in stream")
+        Just (_, f) ->
+            if f.dataType == TypeTimestamp || f.dataType == TypeInt64
+            then
+                let winStartField = requiredField "window_start" TypeTimestamp
+                    winEndField   = requiredField "window_end" TypeTimestamp
+                    extendedFs    = baseSchema.fields ++ [winStartField, winEndField]
+                in Right (Schema extendedFs)
+            else Left ("Window time column must be TIMESTAMP or INT64, but found " ++ show f.dataType)
