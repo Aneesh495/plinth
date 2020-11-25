@@ -1,0 +1,162 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.sql.AST
+    Description: Abstract syntax tree for continuous streaming SQL queries and DDL definitions.
+-}
+
+module org.plinth.sql.AST where
+
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.algebra.Operator
+import org.plinth.algebra.JoinOps
+import org.plinth.algebra.WindowOps
+
+--- SQL scalar expressions, function calls, and column references.
+data SqlExpr =
+      SqlCol       String (Maybe String)   -- column name, optional table qualifier
+    | SqlLit       Value                   -- literal scalar constant
+    | SqlBinOp     BinOp SqlExpr SqlExpr   -- binary operator
+    | SqlUnOp      UnOp SqlExpr            -- unary operator
+    | SqlFunction  String [SqlExpr]        -- function invocation (SUM, COUNT, etc.)
+    | SqlBetween   SqlExpr SqlExpr SqlExpr -- col BETWEEN low AND high
+    | SqlInList    SqlExpr [SqlExpr]       -- col IN (a, b, c)
+    | SqlIsNull    SqlExpr                 -- col IS NULL
+    | SqlIsNotNull SqlExpr                 -- col IS NOT NULL
+    | SqlStar                              -- *
+
+derive Eq SqlExpr
+derive Ord SqlExpr
+
+instance Show SqlExpr where
+    show (SqlCol col qual)   = case qual of
+        Just q  -> q ++ "." ++ col
+        Nothing -> col
+    show (SqlLit v)          = show v
+    show (SqlBinOp op e1 e2) = "(" ++ show e1 ++ " " ++ show op ++ " " ++ show e2 ++ ")"
+    show (SqlUnOp op e)      = show op ++ "(" ++ show e ++ ")"
+    show (SqlFunction f args) = f ++ "(" ++ joined ", " (map show args) ++ ")"
+    show (SqlBetween e l h)  = show e ++ " BETWEEN " ++ show l ++ " AND " ++ show h
+    show (SqlInList e list)  = show e ++ " IN (" ++ joined ", " (map show list) ++ ")"
+    show (SqlIsNull e)       = show e ++ " IS NULL"
+    show (SqlIsNotNull e)    = show e ++ " IS NOT NULL"
+    show SqlStar             = "*"
+
+--- A projected expression in the SELECT clause with an optional alias.
+data SelectItem = SelectItem {
+    expr  :: SqlExpr,
+    alias :: Maybe String
+}
+
+derive Eq SelectItem
+derive Ord SelectItem
+
+instance Show SelectItem where
+    show item = case item.alias of
+        Just a  -> show item.expr ++ " AS " ++ a
+        Nothing -> show item.expr
+
+--- Windowing specification in streaming queries.
+data SqlWindowSpec = SqlWindowSpec {
+    winType :: WindowType,
+    timeCol :: String
+}
+
+derive Eq SqlWindowSpec
+derive Ord SqlWindowSpec
+
+instance Show SqlWindowSpec where
+    show ws = show ws.winType ++ " ON " ++ ws.timeCol
+
+--- Data source in the FROM clause: streams, joins, and windowed streams.
+data TableSource =
+      SourceStream String (Maybe String)
+    | SourceJoin   JoinType TableSource TableSource SqlExpr
+    | SourceWindow TableSource SqlWindowSpec
+
+derive Eq TableSource
+derive Ord TableSource
+
+instance Show TableSource where
+    show (SourceStream s aliasOpt) = case aliasOpt of
+        Just a  -> s ++ " AS " ++ a
+        Nothing -> s
+    show (SourceJoin jt left right onCond) =
+        show left ++ " " ++ show jt ++ " " ++ show right ++ " ON " ++ show onCond
+    show (SourceWindow src ws) =
+        show src ++ " WINDOW " ++ show ws
+
+--- Continuous streaming SELECT query definition.
+data SelectStmt = SelectStmt {
+    projection   :: [SelectItem],
+    fromSource   :: TableSource,
+    whereClause  :: Maybe SqlExpr,
+    groupBy      :: [SqlExpr],
+    havingClause :: Maybe SqlExpr,
+    emitChanges  :: Bool
+}
+
+derive Eq SelectStmt
+derive Ord SelectStmt
+
+instance Show SelectStmt where
+    show q = "SELECT " ++ joined ", " (map show q.projection) ++
+             " FROM " ++ show q.fromSource ++
+             (case q.whereClause of Just w -> " WHERE " ++ show w; Nothing -> "") ++
+             (if null q.groupBy then "" else " GROUP BY " ++ joined ", " (map show q.groupBy)) ++
+             (case q.havingClause of Just h -> " HAVING " ++ show h; Nothing -> "") ++
+             (if q.emitChanges then " EMIT CHANGES" else "")
+
+--- DDL statement to define a new stream relation.
+data CreateStreamStmt = CreateStreamStmt {
+    streamName :: String,
+    schema     :: Schema
+}
+
+derive Eq CreateStreamStmt
+derive Ord CreateStreamStmt
+
+instance Show CreateStreamStmt where
+    show stmt = "CREATE STREAM " ++ stmt.streamName ++ " " ++ show stmt.schema
+
+--- DDL statement to create a continuously updated materialized view.
+data CreateViewStmt = CreateViewStmt {
+    viewName :: String,
+    query    :: SelectStmt
+}
+
+derive Eq CreateViewStmt
+derive Ord CreateViewStmt
+
+instance Show CreateViewStmt where
+    show stmt = "CREATE MATERIALIZED VIEW " ++ stmt.viewName ++ " AS " ++ show stmt.query
+
+--- DML statement to insert events into a target stream.
+data InsertStmt = InsertStmt {
+    targetStream :: String,
+    columnNames  :: Maybe [String],
+    rowValues    :: [[SqlExpr]]
+}
+
+derive Eq InsertStmt
+derive Ord InsertStmt
+
+instance Show InsertStmt where
+    show stmt = "INSERT INTO " ++ stmt.targetStream ++ " VALUES (...)"
+
+--- Top-level streaming SQL statement sum type.
+data SqlStmt =
+      StmtSelect SelectStmt
+    | StmtCreateStream CreateStreamStmt
+    | StmtCreateView CreateViewStmt
+    | StmtInsert InsertStmt
+
+derive Eq SqlStmt
+derive Ord SqlStmt
+
+instance Show SqlStmt where
+    show (StmtSelect s)       = show s
+    show (StmtCreateStream s) = show s
+    show (StmtCreateView s)   = show s
+    show (StmtInsert s)       = show s
