@@ -1,0 +1,438 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.sql.Parser
+    Description: Recursive descent and Pratt precedence climbing parser for streaming SQL.
+-}
+
+module org.plinth.sql.Parser where
+
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.algebra.Operator
+import org.plinth.algebra.JoinOps
+import org.plinth.algebra.WindowOps
+import org.plinth.sql.Token
+import org.plinth.sql.Lexer
+import org.plinth.sql.AST
+
+--- Parser state tracking unconsumed tokens.
+data ParserState = ParserState {
+    tokens :: [Token]
+}
+
+--- Result type returned by parsing steps: either an error message or (result, remaining state).
+type ParseResult a = Either String (a, ParserState)
+
+--- Parse top-level SQL string into AST statement.
+parseSql :: String -> Either String SqlStmt
+parseSql input = case tokenize input of
+    Left err   -> Left ("Lexical error: " ++ err)
+    Right toks -> case parseStmt (ParserState toks) of
+        Right (stmt, st) ->
+            if isEof st
+            then Right stmt
+            else Left ("Unexpected trailing tokens starting at " ++ show (peekPos st))
+        Left err -> Left err
+
+--- Parse a SELECT continuous query string.
+parseSelect :: String -> Either String SelectStmt
+parseSelect input = case parseSql input of
+    Right (StmtSelect s) -> Right s
+    Right _              -> Left "Expected SELECT statement"
+    Left err             -> Left err
+
+--- Parse an isolated SQL scalar expression.
+parseExpression :: String -> Either String SqlExpr
+parseExpression input = case tokenize input of
+    Left err   -> Left ("Lexical error: " ++ err)
+    Right toks -> case parseExpr 0 (ParserState toks) of
+        Right (expr, st) ->
+            if isEof st
+            then Right expr
+            else Left ("Unexpected trailing expression tokens at " ++ show (peekPos st))
+        Left err -> Left err
+
+--- Check if current token is EOF.
+isEof :: ParserState -> Bool
+isEof st = case peekToken st of
+    TokEOF -> true
+    _      -> false
+
+--- Peek at current token kind.
+peekToken :: ParserState -> TokenKind
+peekToken (ParserState (t:_)) = t.kind
+peekToken (ParserState [])    = TokEOF
+
+--- Peek at current token source position.
+peekPos :: ParserState -> SourcePos
+peekPos (ParserState (t:_)) = t.pos
+peekPos (ParserState [])    = initialPos
+
+--- Advance parser state by consuming one token.
+advance :: ParserState -> ParserState
+advance (ParserState (_:ts)) = ParserState ts
+advance (ParserState [])     = ParserState []
+
+--- Expect and consume a specific keyword or token.
+expect :: TokenKind -> ParserState -> ParseResult TokenKind
+expect expected st =
+    let cur = peekToken st
+    in if cur == expected
+       then Right (cur, advance st)
+       else Left ("Expected " ++ show expected ++ " but found " ++ show cur ++ " at " ++ show (peekPos st))
+
+--- Parse statement based on leading token.
+parseStmt :: ParserState -> ParseResult SqlStmt
+parseStmt st = case peekToken st of
+    KwSelect -> case parseSelectStmt st of
+        Right (s, st1) -> Right (StmtSelect s, st1)
+        Left err       -> Left err
+    KwCreate -> case peekToken (advance st) of
+        KwStream -> case parseCreateStream (advance st) of
+            Right (s, st1) -> Right (StmtCreateStream s, st1)
+            Left err       -> Left err
+        KwMaterialized -> case parseCreateView (advance st) of
+            Right (s, st1) -> Right (StmtCreateView s, st1)
+            Left err       -> Left err
+        _ -> Left ("Expected STREAM or MATERIALIZED VIEW after CREATE at " ++ show (peekPos st))
+    KwInsert -> case parseInsertStmt st of
+        Right (s, st1) -> Right (StmtInsert s, st1)
+        Left err       -> Left err
+    other -> Left ("Unexpected statement beginning with " ++ show other ++ " at " ++ show (peekPos st))
+
+--- Parse continuous SELECT statement.
+parseSelectStmt :: ParserState -> ParseResult SelectStmt
+parseSelectStmt st = do
+    (_, st1) <- expect KwSelect st
+    (items, st2) <- parseSelectList st1
+    (_, st3) <- expect KwFrom st2
+    (source, st4) <- parseTableSource st3
+    (whereOpt, st5) <- parseOptionalWhere st4
+    (groupCols, st6) <- parseOptionalGroupBy st5
+    (havingOpt, st7) <- parseOptionalHaving st6
+    (emitChanges, st8) <- parseOptionalEmit st7
+    Right (SelectStmt items source whereOpt groupCols havingOpt emitChanges, st8)
+
+--- Parse comma-separated list of projection items.
+parseSelectList :: ParserState -> ParseResult [SelectItem]
+parseSelectList st = parseCommaList parseSelectItem st
+
+--- Parse a single projected item: expr [AS alias].
+parseSelectItem :: ParserState -> ParseResult SelectItem
+parseSelectItem st = case peekToken st of
+    TokStar -> Right (SelectItem SqlStar Nothing, advance st)
+    _       -> do
+        (expr, st1) <- parseExpr 0 st
+        case peekToken st1 of
+            KwAs -> case peekToken (advance st1) of
+                TokIdent aliasName -> Right (SelectItem expr (Just aliasName), advance (advance st1))
+                other -> Left ("Expected alias name after AS but found " ++ show other ++ " at " ++ show (peekPos st1))
+            TokIdent aliasName -> Right (SelectItem expr (Just aliasName), advance st1)
+            _                  -> Right (SelectItem expr Nothing, st1)
+
+--- Parse table source and optional joins/windowing.
+parseTableSource :: ParserState -> ParseResult TableSource
+parseTableSource st = case peekToken st of
+    TokIdent name ->
+        let st1 = advance st
+            (aliasOpt, st2) = case peekToken st1 of
+                KwAs -> case peekToken (advance st1) of
+                    TokIdent a -> (Just a, advance (advance st1))
+                    _          -> (Nothing, st1)
+                TokIdent a
+                    | a /= "JOIN" && a /= "WHERE" && a /= "GROUP" && a /= "WINDOW" -> (Just a, advance st1)
+                _ -> (Nothing, st1)
+            baseSource = SourceStream name aliasOpt
+        in parseSourceExtensions baseSource st2
+    other -> Left ("Expected stream name in FROM clause but found " ++ show other ++ " at " ++ show (peekPos st))
+
+--- Parse optional JOIN or WINDOW extensions on table source.
+parseSourceExtensions :: TableSource -> ParserState -> ParseResult TableSource
+parseSourceExtensions src st = case peekToken st of
+    KwJoin -> parseJoin JoinInner src (advance st)
+    KwInner -> do
+        (_, st1) <- expect KwJoin (advance st)
+        parseJoin JoinInner src st1
+    KwLeft -> do
+        (_, st1) <- expect KwJoin (advance st)
+        parseJoin JoinLeft src st1
+    KwRight -> do
+        (_, st1) <- expect KwJoin (advance st)
+        parseJoin JoinRight src st1
+    KwFull -> do
+        (_, st1) <- expect KwJoin (advance st)
+        parseJoin JoinFull src st1
+    KwWindow -> do
+        (winSpec, st1) <- parseWindowSpec (advance st)
+        let winSource = SourceWindow src winSpec
+        parseSourceExtensions winSource st1
+    _ -> Right (src, st)
+
+--- Parse JOIN rightSide ON condition.
+parseJoin :: JoinType -> TableSource -> ParserState -> ParseResult TableSource
+parseJoin jt leftSrc st = case peekToken st of
+    TokIdent rightName ->
+        let st1 = advance st
+            rightSrc = SourceStream rightName Nothing
+        in case expect KwOn st1 of
+            Right (_, st2) -> do
+                (cond, st3) <- parseExpr 0 st2
+                let joinedSrc = SourceJoin jt leftSrc rightSrc cond
+                parseSourceExtensions joinedSrc st3
+            Left err -> Left err
+    other -> Left ("Expected right stream name for JOIN but found " ++ show other ++ " at " ++ show (peekPos st))
+
+--- Parse WINDOW clause: TUMBLE(ts, INTERVAL '10' SECOND).
+parseWindowSpec :: ParserState -> ParseResult SqlWindowSpec
+parseWindowSpec st = case peekToken st of
+    KwTumble -> do
+        (_, st1) <- expect TokLParen (advance st)
+        (tsName, st2) <- parseIdent st1
+        (_, st3) <- expect TokComma st2
+        (durVal, st4) <- parseDuration st3
+        (_, st5) <- expect TokRParen st4
+        Right (SqlWindowSpec (TumblingWindow durVal) tsName, st5)
+    KwHop -> do
+        (_, st1) <- expect TokLParen (advance st)
+        (tsName, st2) <- parseIdent st1
+        (_, st3) <- expect TokComma st2
+        (slideDur, st4) <- parseDuration st3
+        (_, st5) <- expect TokComma st4
+        (sizeDur, st6) <- parseDuration st5
+        (_, st7) <- expect TokRParen st6
+        Right (SqlWindowSpec (HoppingWindow slideDur sizeDur) tsName, st7)
+    KwSession -> do
+        (_, st1) <- expect TokLParen (advance st)
+        (tsName, st2) <- parseIdent st1
+        (_, st3) <- expect TokComma st2
+        (gapDur, st4) <- parseDuration st3
+        (_, st5) <- expect TokRParen st4
+        Right (SqlWindowSpec (SessionWindow gapDur) tsName, st5)
+    other -> Left ("Expected TUMBLE, HOP, or SESSION window but found " ++ show other ++ " at " ++ show (peekPos st))
+
+--- Parse an identifier token.
+parseIdent :: ParserState -> ParseResult String
+parseIdent st = case peekToken st of
+    TokIdent s -> Right (s, advance st)
+    other      -> Left ("Expected identifier but found " ++ show other ++ " at " ++ show (peekPos st))
+
+--- Parse duration literal (e.g. 1000 or raw integer microseconds).
+parseDuration :: ParserState -> ParseResult Duration
+parseDuration st = case peekToken st of
+    TokInt n -> Right (Duration n, advance st)
+    other    -> Left ("Expected integer duration in microseconds but found " ++ show other ++ " at " ++ show (peekPos st))
+
+--- Parse optional WHERE clause.
+parseOptionalWhere :: ParserState -> ParseResult (Maybe SqlExpr)
+parseOptionalWhere st = case peekToken st of
+    KwWhere -> do
+        (expr, st1) <- parseExpr 0 (advance st)
+        Right (Just expr, st1)
+    _ -> Right (Nothing, st)
+
+--- Parse optional GROUP BY clause.
+parseOptionalGroupBy :: ParserState -> ParseResult [SqlExpr]
+parseOptionalGroupBy st = case peekToken st of
+    KwGroup -> do
+        (_, st1) <- expect KwBy (advance st)
+        parseCommaList (parseExpr 0) st1
+    _ -> Right ([], st)
+
+--- Parse optional HAVING clause.
+parseOptionalHaving :: ParserState -> ParseResult (Maybe SqlExpr)
+parseOptionalHaving st = case peekToken st of
+    KwHaving -> do
+        (expr, st1) <- parseExpr 0 (advance st)
+        Right (Just expr, st1)
+    _ -> Right (Nothing, st)
+
+--- Parse optional EMIT CHANGES streaming suffix.
+parseOptionalEmit :: ParserState -> ParseResult Bool
+parseOptionalEmit st = case peekToken st of
+    KwEmit -> do
+        (_, st1) <- expect KwChanges (advance st)
+        Right (true, st1)
+    _ -> Right (false, st)
+
+--- Parse CREATE STREAM name (col1 type1, ...).
+parseCreateStream :: ParserState -> ParseResult CreateStreamStmt
+parseCreateStream st = do
+    (_, st1) <- expect KwStream st
+    (streamName, st2) <- parseIdent st1
+    (_, st3) <- expect TokLParen st2
+    (colDefs, st4) <- parseCommaList parseColumnDef st3
+    (_, st5) <- expect TokRParen st4
+    Right (CreateStreamStmt streamName (Schema colDefs), st5)
+
+--- Parse column definition in CREATE STREAM: name TYPE [NOT NULL].
+parseColumnDef :: ParserState -> ParseResult Field
+parseColumnDef st = do
+    (name, st1) <- parseIdent st
+    (dt, st2) <- parseDataType st1
+    case peekToken st2 of
+        KwNot -> do
+            (_, st3) <- expect KwNull (advance st2)
+            Right (Field name dt false, st3)
+        _ -> Right (Field name dt true, st2)
+
+--- Parse SQL data type name.
+parseDataType :: ParserState -> ParseResult DataType
+parseDataType st = case peekToken st of
+    TokIdent s -> case s.toUpperCase of
+        "INT"       -> Right (TypeInt32, advance st)
+        "INT32"     -> Right (TypeInt32, advance st)
+        "INTEGER"   -> Right (TypeInt32, advance st)
+        "BIGINT"    -> Right (TypeInt64, advance st)
+        "INT64"     -> Right (TypeInt64, advance st)
+        "LONG"      -> Right (TypeInt64, advance st)
+        "DOUBLE"    -> Right (TypeFloat64, advance st)
+        "FLOAT"     -> Right (TypeFloat64, advance st)
+        "FLOAT64"   -> Right (TypeFloat64, advance st)
+        "STRING"    -> Right (TypeString, advance st)
+        "VARCHAR"   -> Right (TypeString, advance st)
+        "TEXT"      -> Right (TypeString, advance st)
+        "BOOLEAN"   -> Right (TypeBool, advance st)
+        "BOOL"      -> Right (TypeBool, advance st)
+        "TIMESTAMP" -> Right (TypeTimestamp, advance st)
+        other       -> Left ("Unknown data type '" ++ other ++ "' at " ++ show (peekPos st))
+    other -> Left ("Expected data type name but found " ++ show other ++ " at " ++ show (peekPos st))
+
+--- Parse CREATE MATERIALIZED VIEW name AS SELECT ...
+parseCreateView :: ParserState -> ParseResult CreateViewStmt
+parseCreateView st = do
+    (_, st1) <- expect KwMaterialized st
+    (_, st2) <- expect KwView st1
+    (viewName, st3) <- parseIdent st2
+    (_, st4) <- expect KwAs st3
+    (query, st5) <- parseSelectStmt st4
+    Right (CreateViewStmt viewName query, st5)
+
+--- Parse INSERT INTO stream VALUES (...).
+parseInsertStmt :: ParserState -> ParseResult InsertStmt
+parseInsertStmt st = do
+    (_, st1) <- expect KwInsert st
+    (_, st2) <- expect KwInto st1
+    (streamName, st3) <- parseIdent st2
+    (_, st4) <- expect KwValues st3
+    (rows, st5) <- parseCommaList parseRowValues st4
+    Right (InsertStmt streamName Nothing rows, st5)
+
+--- Parse single row value list: (v1, v2, ...).
+parseRowValues :: ParserState -> ParseResult [SqlExpr]
+parseRowValues st = do
+    (_, st1) <- expect TokLParen st
+    (vals, st2) <- parseCommaList (parseExpr 0) st1
+    (_, st3) <- expect TokRParen st2
+    Right (vals, st3)
+
+--- Helper to parse a comma-separated list of items.
+parseCommaList :: (ParserState -> ParseResult a) -> ParserState -> ParseResult [a]
+parseCommaList parseItem st = do
+    (firstItem, st1) <- parseItem st
+    parseRemaining [firstItem] st1
+  where
+    parseRemaining acc curSt = case peekToken curSt of
+        TokComma -> do
+            (nextItem, nextSt) <- parseItem (advance curSt)
+            parseRemaining (acc ++ [nextItem]) nextSt
+        _ -> Right (acc, curSt)
+
+--- Pratt precedence climbing expression parser.
+parseExpr :: Int -> ParserState -> ParseResult SqlExpr
+parseExpr minPrec st = do
+    (left, st1) <- parsePrimary st
+    parseInfix minPrec left st1
+
+--- Parse infix binary operators with precedence.
+parseInfix :: Int -> SqlExpr -> ParserState -> ParseResult SqlExpr
+parseInfix minPrec left st =
+    let curTok = peekToken st
+    in case getInfixInfo curTok of
+        Just (prec, op) | prec >= minPrec -> do
+            let st1 = advance st
+            (right, st2) <- parseExpr (prec + 1) st1
+            let newLeft = SqlBinOp op left right
+            parseInfix minPrec newLeft st2
+        _ -> case curTok of
+            KwBetween | minPrec <= 5 -> do
+                let st1 = advance st
+                (low, st2) <- parseExpr 6 st1
+                (_, st3) <- expect KwAnd st2
+                (high, st4) <- parseExpr 6 st3
+                let betweenExpr = SqlBetween left low high
+                parseInfix minPrec betweenExpr st4
+            KwIn | minPrec <= 5 -> do
+                let st1 = advance st
+                (_, st2) <- expect TokLParen st1
+                (inList, st3) <- parseCommaList (parseExpr 0) st2
+                (_, st4) <- expect TokRParen st3
+                let inExpr = SqlInList left inList
+                parseInfix minPrec inExpr st4
+            KwIs | minPrec <= 5 -> case peekToken (advance st) of
+                KwNull ->
+                    let isNullExpr = SqlIsNull left
+                    in parseInfix minPrec isNullExpr (advance (advance st))
+                KwNot -> case peekToken (advance (advance st)) of
+                    KwNull ->
+                        let notNullExpr = SqlIsNotNull left
+                        in parseInfix minPrec notNullExpr (advance (advance (advance st)))
+                    other -> Left ("Expected NULL after IS NOT but found " ++ show other ++ " at " ++ show (peekPos st))
+                other -> Left ("Expected NULL or NOT NULL after IS but found " ++ show other ++ " at " ++ show (peekPos st))
+            _ -> Right (left, st)
+
+--- Retrieve precedence level and BinOp for infix operators.
+getInfixInfo :: TokenKind -> Maybe (Int, BinOp)
+getInfixInfo KwOr         = Just (1, OpOr)
+getInfixInfo KwAnd        = Just (2, OpAnd)
+getInfixInfo TokEq        = Just (4, OpEq)
+getInfixInfo TokNeq       = Just (4, OpNeq)
+getInfixInfo TokLt        = Just (5, OpLt)
+getInfixInfo TokLte       = Just (5, OpLte)
+getInfixInfo TokGt        = Just (5, OpGt)
+getInfixInfo TokGte       = Just (5, OpGte)
+getInfixInfo TokPlus      = Just (6, OpAdd)
+getInfixInfo TokMinus     = Just (6, OpSub)
+getInfixInfo TokStar      = Just (7, OpMul)
+getInfixInfo TokSlash     = Just (7, OpDiv)
+getInfixInfo _            = Nothing
+
+--- Parse primary expressions: literals, column references, function calls, and parenthesized sub-expressions.
+parsePrimary :: ParserState -> ParseResult SqlExpr
+parsePrimary st = case peekToken st of
+    TokInt n    -> Right (SqlLit (ValLong n), advance st)
+    TokFloat f  -> Right (SqlLit (ValDouble f), advance st)
+    TokString s -> Right (SqlLit (ValString s), advance st)
+    KwTrue      -> Right (SqlLit (ValBool true), advance st)
+    KwFalse     -> Right (SqlLit (ValBool false), advance st)
+    KwNull      -> Right (SqlLit ValNull, advance st)
+    KwNot       -> do
+        (inner, st1) <- parseExpr 3 (advance st)
+        Right (SqlUnOp OpNot inner, st1)
+    TokMinus    -> do
+        (inner, st1) <- parseExpr 7 (advance st)
+        Right (SqlUnOp OpNeg inner, st1)
+    TokLParen   -> do
+        (inner, st1) <- parseExpr 0 (advance st)
+        (_, st2) <- expect TokRParen st1
+        Right (inner, st2)
+    TokIdent name ->
+        let st1 = advance st
+        in case peekToken st1 of
+            TokDot -> case peekToken (advance st1) of
+                TokIdent colName -> Right (SqlCol colName (Just name), advance (advance st1))
+                other -> Left ("Expected column name after dot but found " ++ show other ++ " at " ++ show (peekPos st1))
+            TokLParen -> do
+                let st2 = advance st1
+                case peekToken st2 of
+                    TokRParen -> Right (SqlFunction name [], advance st2)
+                    TokStar   -> do
+                        let st3 = advance st2
+                        (_, st4) <- expect TokRParen st3
+                        Right (SqlFunction name [SqlStar], st4)
+                    _ -> do
+                        (args, st3) <- parseCommaList (parseExpr 0) st2
+                        (_, st4) <- expect TokRParen st3
+                        Right (SqlFunction name args, st4)
+            _ -> Right (SqlCol name Nothing, st1)
+    other -> Left ("Unexpected token in expression: " ++ show other ++ " at " ++ show (peekPos st))
