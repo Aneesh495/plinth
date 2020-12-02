@@ -1,0 +1,160 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.sql.PlanBuilder
+    Description: Translation from continuous streaming SQL AST into logical relational algebra plans.
+-}
+
+module org.plinth.sql.PlanBuilder where
+
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.algebra.Operator
+import org.plinth.algebra.AggregateOps
+import org.plinth.algebra.WindowOps
+import org.plinth.algebra.JoinOps
+import org.plinth.optimizer.LogicalPlan
+import org.plinth.sql.AST
+import org.plinth.sql.TypeChecker
+
+--- Build a verified LogicalPlan from an AST SelectStmt and Catalog.
+buildPlan :: Catalog -> SelectStmt -> Either String LogicalPlan
+buildPlan cat stmt = do
+    basePlan <- buildSourcePlan cat stmt.fromSource
+    let baseSchema = planSchema basePlan
+
+    -- 1. Apply WHERE filter if present
+    planWithFilter <- case stmt.whereClause of
+        Just whereExpr -> do
+            typedPred <- typeCheckExpr baseSchema whereExpr
+            if typedPred.dataType == TypeBool
+            then Right (LogicalFilter basePlan typedPred.expr)
+            else Left ("WHERE predicate must evaluate to BOOLEAN, but found " ++ show typedPred.dataType)
+        Nothing -> Right basePlan
+
+    let curSchema = planSchema planWithFilter
+
+    -- 2. Detect aggregations in projection and GROUP BY
+    let hasAggregates = any isAggregateItem stmt.projection || not (null stmt.groupBy)
+
+    if hasAggregates
+    then buildAggregatePlan curSchema planWithFilter stmt
+    else buildSimpleProjectPlan curSchema planWithFilter stmt
+
+--- Build source table/join/window plan from AST TableSource.
+buildSourcePlan :: Catalog -> TableSource -> Either String LogicalPlan
+buildSourcePlan cat (SourceStream name _) = case lookupStream name cat of
+    Just s  -> Right (LogicalScan name s)
+    Nothing -> Left ("Stream '" ++ name ++ "' not registered in catalog")
+
+buildSourcePlan cat (SourceJoin jt left right onCond) = do
+    leftPlan  <- buildSourcePlan cat left
+    rightPlan <- buildSourcePlan cat right
+    let leftSchema  = planSchema leftPlan
+        rightSchema = planSchema rightPlan
+        mergedSchema = mergeSchemas leftSchema rightSchema
+    typedCond <- typeCheckExpr mergedSchema onCond
+    if typedCond.dataType == TypeBool
+    then Right (LogicalJoin jt leftPlan rightPlan typedCond.expr mergedSchema)
+    else Left ("JOIN ON condition must evaluate to BOOLEAN")
+
+buildSourcePlan cat (SourceWindow src ws) = do
+    innerPlan <- buildSourcePlan cat src
+    let innerSchema = planSchema innerPlan
+    case findField ws.timeCol innerSchema of
+        Nothing -> Left ("Window column '" ++ ws.timeCol ++ "' not found in stream")
+        Just (idx, f) ->
+            if f.dataType == TypeTimestamp || f.dataType == TypeInt64
+            then
+                let startF = requiredField "window_start" TypeTimestamp
+                    endF   = requiredField "window_end" TypeTimestamp
+                    outSchema = Schema (innerSchema.fields ++ [startF, endF])
+                in Right (LogicalWindow innerPlan ws.winType idx outSchema)
+            else Left ("Window column must be TIMESTAMP or INT64")
+
+--- Check if a projected item contains an aggregate function.
+isAggregateItem :: SelectItem -> Bool
+isAggregateItem (SelectItem (SqlFunction name _) _) =
+    name.toUpperCase `elem` ["COUNT", "SUM", "AVG", "MIN", "MAX"]
+isAggregateItem _ = false
+
+--- Build plan for queries without aggregation.
+buildSimpleProjectPlan :: Schema -> LogicalPlan -> SelectStmt -> Either String LogicalPlan
+buildSimpleProjectPlan curSchema inputPlan stmt = do
+    (exprs, outFields) <- resolveProjections curSchema stmt.projection
+    Right (LogicalProject inputPlan exprs (Schema outFields))
+
+--- Build plan for queries with GROUP BY and aggregations.
+buildAggregatePlan :: Schema -> LogicalPlan -> SelectStmt -> Either String LogicalPlan
+buildAggregatePlan curSchema inputPlan stmt = do
+    -- Resolve group keys
+    groupKeyResults <- mapM (typeCheckExpr curSchema) stmt.groupBy
+    let keyExprs = map TypedExpr.expr groupKeyResults
+        extractColIdx (ExprColRef idx) = Right idx
+        extractColIdx _                = Left "Only column references currently supported in GROUP BY keys"
+    keyIndices <- mapM extractColIdx keyExprs
+    let keyFields = [ curSchema.fields !! idx | idx <- keyIndices ]
+
+    -- Extract aggregate function specs
+    aggSpecs <- extractAggSpecs curSchema stmt.projection
+    let aggFields = [ requiredField spec.outputName (aggResultType spec.kind) | spec <- aggSpecs ]
+        aggSchema = Schema (keyFields ++ aggFields)
+        aggPlan   = LogicalAggregate inputPlan keyIndices aggSpecs aggSchema
+
+    Right aggPlan
+
+--- Extract aggregate specs from SELECT projection list.
+extractAggSpecs :: Schema -> [SelectItem] -> Either String [AggSpec]
+extractAggSpecs curSchema items =
+    let aggItems = [ item | item <- items, isAggregateItem item ]
+        extractSpec (SelectItem (SqlFunction fnName args) aliasOpt) =
+            let kind = case fnName.toUpperCase of
+                    "COUNT" -> Right AggCount
+                    "SUM"   -> Right AggSum
+                    "AVG"   -> Right AggAvg
+                    "MIN"   -> Right AggMin
+                    "MAX"   -> Right AggMax
+                    other   -> Left ("Unknown aggregate function " ++ other)
+                outName = case aliasOpt of
+                    Just a  -> a
+                    Nothing -> fnName.toLowerCase
+                argIdx = if null args || head args == SqlStar
+                         then 0
+                         else case head args of
+                             SqlCol c _ -> case findField c curSchema of
+                                 Just (idx, _) -> idx
+                                 Nothing       -> 0
+                             _ -> 0
+            in case kind of
+                Right k  -> Right (AggSpec k argIdx outName)
+                Left err -> Left err
+        extractSpec _ = Left "Expected aggregate function"
+    in mapM extractSpec aggItems
+
+--- Resulting data type of an aggregation kind.
+aggResultType :: AggKind -> DataType
+aggResultType AggCount = TypeInt64
+aggResultType AggSum   = TypeFloat64
+aggResultType AggAvg   = TypeFloat64
+aggResultType AggMin   = TypeFloat64
+aggResultType AggMax   = TypeFloat64
+
+--- Resolve projection expressions and derive output schema fields.
+resolveProjections :: Schema -> [SelectItem] -> Either String ([RelExpr], [Field])
+resolveProjections curSchema items =
+    let expandStar item = case item of
+            SelectItem SqlStar _ ->
+                [ SelectItem (SqlCol f.name Nothing) Nothing | f <- curSchema.fields ]
+            other -> [other]
+        expandedItems = concatMap expandStar items
+        resolveOne (SelectItem astExpr aliasOpt) = do
+            typed <- typeCheckExpr curSchema astExpr
+            let colName = case aliasOpt of
+                    Just a  -> a
+                    Nothing -> case astExpr of
+                        SqlCol n _ -> n
+                        _          -> "col_" ++ show typed.expr
+            Right (typed.expr, requiredField colName typed.dataType)
+    in do
+        pairs <- mapM resolveOne expandedItems
+        Right (map fst pairs, map snd pairs)
