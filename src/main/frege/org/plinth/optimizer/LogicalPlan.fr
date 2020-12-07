@@ -1,0 +1,117 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.optimizer.LogicalPlan
+    Description: Logical query plan representations, tree traversals, and structural properties.
+-}
+
+module org.plinth.optimizer.LogicalPlan where
+
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.algebra.Operator
+import org.plinth.algebra.AggregateOps
+import org.plinth.algebra.WindowOps
+import org.plinth.algebra.JoinOps
+
+--- Relational streaming logical query plan tree nodes.
+data LogicalPlan =
+      LogicalScan      { streamName :: String, schema :: Schema }
+    | LogicalFilter    { input :: LogicalPlan, predicate :: RelExpr }
+    | LogicalProject   { input :: LogicalPlan, expressions :: [RelExpr], schema :: Schema }
+    | LogicalJoin      { joinType :: JoinType, left :: LogicalPlan, right :: LogicalPlan, onCondition :: RelExpr, schema :: Schema }
+    | LogicalWindow    { input :: LogicalPlan, windowType :: WindowType, timeColIdx :: Int, schema :: Schema }
+    | LogicalAggregate { input :: LogicalPlan, groupKeyIndices :: [Int], aggSpecs :: [AggSpec], schema :: Schema }
+    | LogicalUnion     { left :: LogicalPlan, right :: LogicalPlan, schema :: Schema }
+
+derive Eq LogicalPlan
+derive Ord LogicalPlan
+
+instance Show LogicalPlan where
+    show plan = prettyPrintPlan 0 plan
+
+--- Pretty print logical plan as an indented tree.
+prettyPrintPlan :: Int -> LogicalPlan -> String
+prettyPrintPlan indent plan =
+    let pad = packed (replicate (indent * 2) ' ')
+    in case plan of
+        LogicalScan name s ->
+            pad ++ "LogicalScan(stream=" ++ name ++ ", schema=" ++ show s ++ ")"
+        LogicalFilter inp pred ->
+            pad ++ "LogicalFilter(predicate=" ++ show pred ++ ")\n" ++
+            prettyPrintPlan (indent + 1) inp
+        LogicalProject inp exprs s ->
+            pad ++ "LogicalProject(exprs=" ++ joined ", " (map show exprs) ++ ")\n" ++
+            prettyPrintPlan (indent + 1) inp
+        LogicalJoin jt l r cond s ->
+            pad ++ "LogicalJoin(type=" ++ show jt ++ ", on=" ++ show cond ++ ")\n" ++
+            prettyPrintPlan (indent + 1) l ++ "\n" ++
+            prettyPrintPlan (indent + 1) r
+        LogicalWindow inp wt idx s ->
+            pad ++ "LogicalWindow(type=" ++ show wt ++ ", timeCol=$" ++ show idx ++ ")\n" ++
+            prettyPrintPlan (indent + 1) inp
+        LogicalAggregate inp keys specs s ->
+            pad ++ "LogicalAggregate(keys=" ++ show keys ++ ", specs=" ++ show specs ++ ")\n" ++
+            prettyPrintPlan (indent + 1) inp
+        LogicalUnion l r s ->
+            pad ++ "LogicalUnion\n" ++
+            prettyPrintPlan (indent + 1) l ++ "\n" ++
+            prettyPrintPlan (indent + 1) r
+
+--- Retrieve the output schema of any logical plan node.
+planSchema :: LogicalPlan -> Schema
+planSchema (LogicalScan _ s)          = s
+planSchema (LogicalFilter inp _)      = planSchema inp
+planSchema (LogicalProject _ _ s)     = s
+planSchema (LogicalJoin _ _ _ _ s)    = s
+planSchema (LogicalWindow _ _ _ s)    = s
+planSchema (LogicalAggregate _ _ _ s) = s
+planSchema (LogicalUnion _ _ s)       = s
+
+--- Calculate the tree depth of a logical plan.
+planDepth :: LogicalPlan -> Int
+planDepth (LogicalScan _ _)           = 1
+planDepth (LogicalFilter inp _)       = 1 + planDepth inp
+planDepth (LogicalProject inp _ _)    = 1 + planDepth inp
+planDepth (LogicalJoin _ l r _ _)     = 1 + max (planDepth l) (planDepth r)
+planDepth (LogicalWindow inp _ _ _)   = 1 + planDepth inp
+planDepth (LogicalAggregate inp _ _ _) = 1 + planDepth inp
+planDepth (LogicalUnion l r _)        = 1 + max (planDepth l) (planDepth r)
+
+--- Count total number of operator nodes in the logical plan tree.
+nodeCount :: LogicalPlan -> Int
+nodeCount (LogicalScan _ _)           = 1
+nodeCount (LogicalFilter inp _)       = 1 + nodeCount inp
+nodeCount (LogicalProject inp _ _)    = 1 + nodeCount inp
+nodeCount (LogicalJoin _ l r _ _)     = 1 + nodeCount l + nodeCount r
+nodeCount (LogicalWindow inp _ _ _)   = 1 + nodeCount inp
+nodeCount (LogicalAggregate inp _ _ _) = 1 + nodeCount inp
+nodeCount (LogicalUnion l r _)        = 1 + nodeCount l + nodeCount r
+
+--- Extract list of underlying stream names scanned by this plan.
+scannedStreams :: LogicalPlan -> [String]
+scannedStreams (LogicalScan name _)         = [name]
+scannedStreams (LogicalFilter inp _)        = scannedStreams inp
+scannedStreams (LogicalProject inp _ _)     = scannedStreams inp
+scannedStreams (LogicalJoin _ l r _ _)      = scannedStreams l ++ scannedStreams r
+scannedStreams (LogicalWindow inp _ _ _)    = scannedStreams inp
+scannedStreams (LogicalAggregate inp _ _ _) = scannedStreams inp
+scannedStreams (LogicalUnion l r _)         = scannedStreams l ++ scannedStreams r
+
+--- Extract all column indices referenced in a RelExpr.
+exprColRefs :: RelExpr -> [Int]
+exprColRefs (ExprColRef idx)      = [idx]
+exprColRefs (ExprLiteral _)       = []
+exprColRefs (ExprUnary _ inner)   = exprColRefs inner
+exprColRefs (ExprBinary _ e1 e2)  = exprColRefs e1 ++ exprColRefs e2
+
+--- Extract all input column indices required by an operator node.
+requiredColumns :: LogicalPlan -> [Int]
+requiredColumns (LogicalScan _ _)          = []
+requiredColumns (LogicalFilter inp pred)   = exprColRefs pred ++ requiredColumns inp
+requiredColumns (LogicalProject inp es _)  = concatMap exprColRefs es ++ requiredColumns inp
+requiredColumns (LogicalJoin _ l r cond _) = exprColRefs cond ++ requiredColumns l ++ requiredColumns r
+requiredColumns (LogicalWindow inp _ i _)  = [i] ++ requiredColumns inp
+requiredColumns (LogicalAggregate inp ks ss _) =
+    ks ++ [s.argColIdx | s <- ss, s.argColIdx >= 0] ++ requiredColumns inp
+requiredColumns (LogicalUnion l r _)       = requiredColumns l ++ requiredColumns r
