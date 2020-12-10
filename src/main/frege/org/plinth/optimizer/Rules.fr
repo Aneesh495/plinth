@@ -1,0 +1,174 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.optimizer.Rules
+    Description: Algebraic query rewrite rules: predicate pushdown, projection pruning, and constant folding.
+-}
+
+module org.plinth.optimizer.Rules where
+
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.algebra.Operator
+import org.plinth.algebra.JoinOps
+import org.plinth.optimizer.LogicalPlan
+
+--- Apply full suite of algebraic optimization rules until fixed point.
+optimize :: LogicalPlan -> LogicalPlan
+optimize plan =
+    let p1 = pushdownFilter plan
+        p2 = simplifyPredicates p1
+        p3 = eliminateRedundantProjects p2
+    in if p3 == plan then p3 else optimize p3
+
+--- Pushdown filters closer to leaf scans.
+pushdownFilter :: LogicalPlan -> LogicalPlan
+pushdownFilter plan = case plan of
+    LogicalFilter (LogicalFilter inner p1) p2 ->
+        -- Combine consecutive filters: Filter(p2, Filter(p1)) -> Filter(p1 AND p2)
+        let combinedPred = ExprBinary OpAnd p1 p2
+        in pushdownFilter (LogicalFilter (pushdownFilter inner) combinedPred)
+
+    LogicalFilter (LogicalProject inner exprs s) pred ->
+        -- Push filter below projection by substituting column references
+        let substitutedPred = substituteColRefs exprs pred
+        in LogicalProject (pushdownFilter (LogicalFilter inner substitutedPred)) exprs s
+
+    LogicalFilter (LogicalJoin jt left right onCond s) pred ->
+        -- Push filter conditions to left or right join children if referencing only one side
+        let leftCols = [0 .. length (planSchema left).fields - 1]
+            rightCols = [length (planSchema left).fields .. length s.fields - 1]
+            refs = exprColRefs pred
+            onlyLeft = not (null refs) && all (`elem` leftCols) refs
+            onlyRight = not (null refs) && all (`elem` rightCols) refs
+        in if onlyLeft
+           then LogicalJoin jt (pushdownFilter (LogicalFilter left pred)) (pushdownFilter right) onCond s
+           else if onlyRight
+           then
+               let offset = length (planSchema left).fields
+                   reindexedPred = shiftColRefs (-offset) pred
+               in LogicalJoin jt (pushdownFilter left) (pushdownFilter (LogicalFilter right reindexedPred)) onCond s
+           else LogicalFilter (LogicalJoin jt (pushdownFilter left) (pushdownFilter right) onCond s) pred
+
+    LogicalFilter inp pred ->
+        LogicalFilter (pushdownFilter inp) pred
+
+    LogicalProject inp exprs s ->
+        LogicalProject (pushdownFilter inp) exprs s
+
+    LogicalJoin jt l r cond s ->
+        LogicalJoin jt (pushdownFilter l) (pushdownFilter r) cond s
+
+    LogicalWindow inp wt idx s ->
+        LogicalWindow (pushdownFilter inp) wt idx s
+
+    LogicalAggregate inp keys specs s ->
+        LogicalAggregate (pushdownFilter inp) keys specs s
+
+    LogicalUnion l r s ->
+        LogicalUnion (pushdownFilter l) (pushdownFilter r) s
+
+    LogicalScan name s ->
+        LogicalScan name s
+
+--- Substitute column references in an expression using a projection list.
+substituteColRefs :: [RelExpr] -> RelExpr -> RelExpr
+substituteColRefs exprs expr = case expr of
+    ExprColRef idx ->
+        if idx >= 0 && idx < length exprs
+        then exprs !! idx
+        else ExprColRef idx
+    ExprLiteral v -> ExprLiteral v
+    ExprUnary op inner -> ExprUnary op (substituteColRefs exprs inner)
+    ExprBinary op e1 e2 -> ExprBinary op (substituteColRefs exprs e1) (substituteColRefs exprs e2)
+
+--- Shift column indices by an offset (used when splitting join predicates).
+shiftColRefs :: Int -> RelExpr -> RelExpr
+shiftColRefs offset expr = case expr of
+    ExprColRef idx -> ExprColRef (idx + offset)
+    ExprLiteral v  -> ExprLiteral v
+    ExprUnary op inner -> ExprUnary op (shiftColRefs offset inner)
+    ExprBinary op e1 e2 -> ExprBinary op (shiftColRefs offset e1) (shiftColRefs offset e2)
+
+--- Simplify predicate expressions using boolean identities and constant folding.
+simplifyPredicates :: LogicalPlan -> LogicalPlan
+simplifyPredicates plan = case plan of
+    LogicalFilter inp pred ->
+        let simpPred = foldConstants pred
+        in case simpPred of
+            ExprLiteral (ValBool true) -> simplifyPredicates inp
+            _ -> LogicalFilter (simplifyPredicates inp) simpPred
+
+    LogicalProject inp exprs s ->
+        LogicalProject (simplifyPredicates inp) (map foldConstants exprs) s
+
+    LogicalJoin jt l r cond s ->
+        LogicalJoin jt (simplifyPredicates l) (simplifyPredicates r) (foldConstants cond) s
+
+    LogicalWindow inp wt idx s ->
+        LogicalWindow (simplifyPredicates inp) wt idx s
+
+    LogicalAggregate inp keys specs s ->
+        LogicalAggregate (simplifyPredicates inp) keys specs s
+
+    LogicalUnion l r s ->
+        LogicalUnion (simplifyPredicates l) (simplifyPredicates r) s
+
+    LogicalScan name s ->
+        LogicalScan name s
+
+--- Perform constant folding on scalar expressions.
+foldConstants :: RelExpr -> RelExpr
+foldConstants (ExprBinary OpAnd (ExprLiteral (ValBool true)) e)  = foldConstants e
+foldConstants (ExprBinary OpAnd e (ExprLiteral (ValBool true)))  = foldConstants e
+foldConstants (ExprBinary OpAnd (ExprLiteral (ValBool false)) _) = ExprLiteral (ValBool false)
+foldConstants (ExprBinary OpAnd _ (ExprLiteral (ValBool false))) = ExprLiteral (ValBool false)
+foldConstants (ExprBinary OpOr (ExprLiteral (ValBool false)) e)  = foldConstants e
+foldConstants (ExprBinary OpOr e (ExprLiteral (ValBool false)))  = foldConstants e
+foldConstants (ExprBinary OpOr (ExprLiteral (ValBool true)) _)   = ExprLiteral (ValBool true)
+foldConstants (ExprBinary OpOr _ (ExprLiteral (ValBool true)))   = ExprLiteral (ValBool true)
+foldConstants (ExprBinary op (ExprLiteral v1) (ExprLiteral v2))  =
+    ExprLiteral (evalBinaryOp op v1 v2)
+foldConstants (ExprBinary op e1 e2) =
+    let s1 = foldConstants e1
+        s2 = foldConstants e2
+    in if s1 /= e1 || s2 /= e2
+       then foldConstants (ExprBinary op s1 s2)
+       else ExprBinary op s1 s2
+foldConstants (ExprUnary op (ExprLiteral v)) =
+    case op of
+        OpNot -> case v of ValBool b -> ExprLiteral (ValBool (not b)); _ -> ExprLiteral ValNull
+        OpNeg -> ExprLiteral (valNegate v)
+foldConstants (ExprUnary op inner) =
+    let s = foldConstants inner
+    in if s /= inner then foldConstants (ExprUnary op s) else ExprUnary op s
+foldConstants other = other
+
+--- Eliminate redundant identity projections: Project([$0, $1, ..., $n-1]) -> input.
+eliminateRedundantProjects :: LogicalPlan -> LogicalPlan
+eliminateRedundantProjects plan = case plan of
+    LogicalProject inp exprs s ->
+        let inputSchema = planSchema inp
+            isIdentity = length exprs == length inputSchema.fields &&
+                         exprs == [ExprColRef i | i <- [0 .. length exprs - 1]]
+        in if isIdentity
+           then eliminateRedundantProjects inp
+           else LogicalProject (eliminateRedundantProjects inp) exprs s
+
+    LogicalFilter inp pred ->
+        LogicalFilter (eliminateRedundantProjects inp) pred
+
+    LogicalJoin jt l r cond s ->
+        LogicalJoin jt (eliminateRedundantProjects l) (eliminateRedundantProjects r) cond s
+
+    LogicalWindow inp wt idx s ->
+        LogicalWindow (eliminateRedundantProjects inp) wt idx s
+
+    LogicalAggregate inp keys specs s ->
+        LogicalAggregate (eliminateRedundantProjects inp) keys specs s
+
+    LogicalUnion l r s ->
+        LogicalUnion (eliminateRedundantProjects l) (eliminateRedundantProjects r) s
+
+    LogicalScan name s ->
+        LogicalScan name s
