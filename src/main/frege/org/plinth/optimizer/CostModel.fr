@@ -1,0 +1,168 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.optimizer.CostModel
+    Description: Cardinality estimation, operator cost modeling, and join reordering.
+-}
+
+module org.plinth.optimizer.CostModel where
+
+import frege.data.TreeMap as TM
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.algebra.Operator
+import org.plinth.algebra.JoinOps
+import org.plinth.optimizer.LogicalPlan
+
+--- Statistics catalog maintaining table cardinality and column distinct values.
+data TableStatistics = TableStatistics {
+    cardinality      :: Long,
+    distinctValues   :: TM.TreeMap Int Long,
+    nullCounts       :: TM.TreeMap Int Long
+}
+
+instance Eq TableStatistics where
+    s1 == s2 = s1.cardinality == s2.cardinality &&
+               TM.each s1.distinctValues == TM.each s2.distinctValues &&
+               TM.each s1.nullCounts == TM.each s2.nullCounts
+    hashCode s = hashCode s.cardinality
+
+instance Ord TableStatistics where
+    s1 <=> s2 = s1.cardinality <=> s2.cardinality
+
+instance Show TableStatistics where
+    show ts = "Stats(rows=" ++ show ts.cardinality ++ ")"
+
+--- Construct default statistics for a stream of given row estimate.
+defaultStats :: Long -> TableStatistics
+defaultStats n = TableStatistics n empty empty
+
+--- Estimate output cardinality of a logical plan.
+estimateCardinality :: TableStatistics -> LogicalPlan -> Long
+estimateCardinality stats (LogicalScan _ _) =
+    stats.cardinality
+
+estimateCardinality stats (LogicalFilter inp pred) =
+    let inCard = estimateCardinality stats inp
+        sel    = estimateSelectivity stats pred
+        outC   = roundDouble (fromIntegral inCard * sel)
+    in max 1L outC
+
+estimateCardinality stats (LogicalProject inp _ _) =
+    estimateCardinality stats inp
+
+estimateCardinality stats (LogicalJoin _ left right _ _) =
+    let cardL = estimateCardinality stats left
+        cardR = estimateCardinality stats right
+        -- Estimate equi-join output cardinality: (cardL * cardR) / max(ndvL, ndvR, 100)
+        denom = 1000.0
+        joinedCard = roundDouble ((fromIntegral cardL * fromIntegral cardR) / denom)
+    in max 1L joinedCard
+
+estimateCardinality stats (LogicalWindow inp _ _ _) =
+    estimateCardinality stats inp
+
+estimateCardinality stats (LogicalAggregate inp keys _ _) =
+    let inCard = estimateCardinality stats inp
+        -- Number of distinct groups estimated as min(inCard, 2^(length keys * 8))
+        maxGroups = fromIntegral (length keys * 50) :: Long
+    in min inCard (max 1L maxGroups)
+
+estimateCardinality stats (LogicalUnion l r _) =
+    estimateCardinality stats l + estimateCardinality stats r
+
+--- Estimate filter selectivity as a Double in [0.0, 1.0].
+estimateSelectivity :: TableStatistics -> RelExpr -> Double
+estimateSelectivity stats (ExprBinary OpEq (ExprColRef idx) (ExprLiteral _)) =
+    case TM.lookup idx stats.distinctValues of
+        Just ndv | ndv > 0L -> 1.0 / fromIntegral ndv
+        _                   -> 0.05
+estimateSelectivity stats (ExprBinary OpEq (ExprLiteral _) (ExprColRef idx)) =
+    estimateSelectivity stats (ExprBinary OpEq (ExprColRef idx) (ExprLiteral ValNull))
+estimateSelectivity _ (ExprBinary OpEq _ _)  = 0.1
+estimateSelectivity _ (ExprBinary OpNeq _ _) = 0.9
+estimateSelectivity _ (ExprBinary OpLt _ _)  = 0.33
+estimateSelectivity _ (ExprBinary OpLte _ _) = 0.33
+estimateSelectivity _ (ExprBinary OpGt _ _)  = 0.33
+estimateSelectivity _ (ExprBinary OpGte _ _) = 0.33
+estimateSelectivity stats (ExprBinary OpAnd e1 e2) =
+    estimateSelectivity stats e1 * estimateSelectivity stats e2
+estimateSelectivity stats (ExprBinary OpOr e1 e2) =
+    let s1 = estimateSelectivity stats e1
+        s2 = estimateSelectivity stats e2
+    in s1 + s2 - (s1 * s2)
+estimateSelectivity stats (ExprUnary OpNot e) =
+    1.0 - estimateSelectivity stats e
+estimateSelectivity _ (ExprLiteral (ValBool true))  = 1.0
+estimateSelectivity _ (ExprLiteral (ValBool false)) = 0.0
+estimateSelectivity _ _ = 0.5
+
+--- Helper to round Double to Long without type ambiguity.
+pure native roundDouble "(long)Math.round" :: Double -> Long
+
+--- Comprehensive cost model: estimates cumulative CPU, Memory, and I/O cost.
+estimateCost :: TableStatistics -> LogicalPlan -> Double
+estimateCost stats plan = case plan of
+    LogicalScan name s ->
+        let rows = fromIntegral (stats.cardinality) :: Double
+            colCount = fromIntegral (length s.fields) :: Double
+        in rows * colCount * 0.1 -- Scan I/O cost
+
+    LogicalFilter inp pred ->
+        let inCost = estimateCost stats inp
+            inCard = fromIntegral (estimateCardinality stats inp) :: Double
+        in inCost + (inCard * 0.25) -- Expression evaluation CPU cost
+
+    LogicalProject inp exprs s ->
+        let inCost = estimateCost stats inp
+            inCard = fromIntegral (estimateCardinality stats inp) :: Double
+            exprCost = fromIntegral (length exprs) :: Double
+        in inCost + (inCard * exprCost * 0.15)
+
+    LogicalJoin jt l r cond s ->
+        let costL = estimateCost stats l
+            costR = estimateCost stats r
+            cardL = fromIntegral (estimateCardinality stats l) :: Double
+            cardR = fromIntegral (estimateCardinality stats r) :: Double
+            -- Hash Join cost: build hash table on smaller side + probe with larger side
+            hashBuildCost = min cardL cardR * 1.5
+            probeCost     = max cardL cardR * 0.8
+        in costL + costR + hashBuildCost + probeCost
+
+    LogicalWindow inp wt idx s ->
+        let inCost = estimateCost stats inp
+            inCard = fromIntegral (estimateCardinality stats inp) :: Double
+        in inCost + (inCard * 0.4)
+
+    LogicalAggregate inp keys specs s ->
+        let inCost = estimateCost stats inp
+            inCard = fromIntegral (estimateCardinality stats inp) :: Double
+            aggCount = fromIntegral (length specs) :: Double
+        in inCost + (inCard * aggCount * 0.7) -- State maintenance cost
+
+    LogicalUnion l r s ->
+        estimateCost stats l + estimateCost stats r
+
+--- Cost-based join reordering: places the smaller relation on the left build side.
+reorderJoin :: TableStatistics -> LogicalPlan -> LogicalPlan
+reorderJoin stats plan = case plan of
+    LogicalJoin JoinInner l r cond s ->
+        let cardL = estimateCardinality stats l
+            cardR = estimateCardinality stats r
+        in if cardR < cardL
+           then LogicalJoin JoinInner (reorderJoin stats r) (reorderJoin stats l) cond s
+           else LogicalJoin JoinInner (reorderJoin stats l) (reorderJoin stats r) cond s
+    LogicalFilter inp pred ->
+        LogicalFilter (reorderJoin stats inp) pred
+    LogicalProject inp exprs s ->
+        LogicalProject (reorderJoin stats inp) exprs s
+    LogicalWindow inp wt idx s ->
+        LogicalWindow (reorderJoin stats inp) wt idx s
+    LogicalAggregate inp keys specs s ->
+        LogicalAggregate (reorderJoin stats inp) keys specs s
+    LogicalUnion l r s ->
+        LogicalUnion (reorderJoin stats l) (reorderJoin stats r) s
+    LogicalScan name s ->
+        LogicalScan name s
+    LogicalJoin jt l r cond s ->
+        LogicalJoin jt (reorderJoin stats l) (reorderJoin stats r) cond s
