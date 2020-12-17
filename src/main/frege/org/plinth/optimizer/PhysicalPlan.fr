@@ -1,0 +1,144 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.optimizer.PhysicalPlan
+    Description: Physical execution plan generation, operator mapping, and runtime execution graph binding.
+-}
+
+module org.plinth.optimizer.PhysicalPlan where
+
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.algebra.Operator
+import org.plinth.algebra.AggregateOps
+import org.plinth.algebra.WindowOps
+import org.plinth.algebra.JoinOps
+import org.plinth.optimizer.LogicalPlan
+import org.plinth.optimizer.Rules
+
+--- Concrete executable physical operator tree.
+data PhysicalPlan =
+      PhysicalScan {
+          streamId      :: StreamId,
+          schema        :: Schema,
+          pushdownPred  :: Maybe RelExpr,
+          projectedCols :: [Int]
+      }
+    | PhysicalFilter {
+          input     :: PhysicalPlan,
+          predicate :: RelExpr
+      }
+    | PhysicalProject {
+          input       :: PhysicalPlan,
+          expressions :: [RelExpr],
+          schema      :: Schema
+      }
+    | PhysicalJoin {
+          joinType :: JoinType,
+          left     :: PhysicalPlan,
+          right    :: PhysicalPlan,
+          leftKey  :: Int,
+          rightKey :: Int,
+          schema   :: Schema
+      }
+    | PhysicalWindow {
+          input      :: PhysicalPlan,
+          windowType :: WindowType,
+          timeColIdx :: Int,
+          schema     :: Schema
+      }
+    | PhysicalAggregate {
+          input       :: PhysicalPlan,
+          keyIndices  :: [Int],
+          aggSpecs    :: [AggSpec],
+          schema      :: Schema
+      }
+
+derive Eq PhysicalPlan
+derive Ord PhysicalPlan
+
+instance Show PhysicalPlan where
+    show p = prettyPrintPhysical 0 p
+
+--- Formatted multi-line representation of the physical execution plan.
+prettyPrintPhysical :: Int -> PhysicalPlan -> String
+prettyPrintPhysical indent plan =
+    let pad = packed (replicate (indent * 2) ' ')
+    in case plan of
+        PhysicalScan (StreamId name) s predOpt cols ->
+            pad ++ "PhysicalScan(stream=" ++ name ++
+            ", cols=" ++ show cols ++
+            (case predOpt of Just p -> ", pushdown=" ++ show p; Nothing -> "") ++ ")"
+        PhysicalFilter inp pred ->
+            pad ++ "PhysicalFilter(" ++ show pred ++ ")\n" ++
+            prettyPrintPhysical (indent + 1) inp
+        PhysicalProject inp exprs s ->
+            pad ++ "PhysicalProject(" ++ joined ", " (map show exprs) ++ ")\n" ++
+            prettyPrintPhysical (indent + 1) inp
+        PhysicalJoin jt l r lKey rKey s ->
+            pad ++ "PhysicalDifferentialJoin(" ++ show jt ++
+            ", leftKey=$" ++ show lKey ++ ", rightKey=$" ++ show rKey ++ ")\n" ++
+            prettyPrintPhysical (indent + 1) l ++ "\n" ++
+            prettyPrintPhysical (indent + 1) r
+        PhysicalWindow inp wt idx s ->
+            pad ++ "PhysicalWindow(" ++ show wt ++ " on $" ++ show idx ++ ")\n" ++
+            prettyPrintPhysical (indent + 1) inp
+        PhysicalAggregate inp keys specs s ->
+            pad ++ "PhysicalAggregate(keys=" ++ show keys ++ ", specs=" ++ show specs ++ ")\n" ++
+            prettyPrintPhysical (indent + 1) inp
+
+--- Retrieve output schema of a physical plan node.
+physicalSchema :: PhysicalPlan -> Schema
+physicalSchema (PhysicalScan _ s _ _)     = s
+physicalSchema (PhysicalFilter inp _)     = physicalSchema inp
+physicalSchema (PhysicalProject _ _ s)    = s
+physicalSchema (PhysicalJoin _ _ _ _ _ s) = s
+physicalSchema (PhysicalWindow _ _ _ s)   = s
+physicalSchema (PhysicalAggregate _ _ _ s)= s
+
+--- Translate an optimized LogicalPlan into an executable PhysicalPlan.
+toPhysicalPlan :: LogicalPlan -> PhysicalPlan
+toPhysicalPlan lPlan =
+    let optPlan = optimize lPlan
+    in convertNode optPlan
+  where
+    convertNode (LogicalScan name s) =
+        let allCols = [0 .. length s.fields - 1]
+        in PhysicalScan (StreamId name) s Nothing allCols
+
+    convertNode (LogicalFilter (LogicalScan name s) pred) =
+        -- Pushdown filter directly into scan
+        let allCols = [0 .. length s.fields - 1]
+        in PhysicalScan (StreamId name) s (Just pred) allCols
+
+    convertNode (LogicalFilter inp pred) =
+        PhysicalFilter (convertNode inp) pred
+
+    convertNode (LogicalProject inp exprs s) =
+        PhysicalProject (convertNode inp) exprs s
+
+    convertNode (LogicalJoin jt l r onCond s) =
+        let (lKey, rKey) = extractEquiJoinKeys onCond (length (planSchema l).fields)
+            physL = convertNode l
+            physR = convertNode r
+        in PhysicalJoin jt physL physR lKey rKey s
+
+    convertNode (LogicalWindow inp wt idx s) =
+        PhysicalWindow (convertNode inp) wt idx s
+
+    convertNode (LogicalAggregate inp keys specs s) =
+        PhysicalAggregate (convertNode inp) keys specs s
+
+    convertNode (LogicalUnion l r s) =
+        -- Union mapped to left plan by default
+        convertNode l
+
+--- Extract left and right column indices from an equi-join predicate: leftCol = rightCol.
+extractEquiJoinKeys :: RelExpr -> Int -> (Int, Int)
+extractEquiJoinKeys (ExprBinary OpEq (ExprColRef idx1) (ExprColRef idx2)) numLeftCols =
+    if idx1 < numLeftCols && idx2 >= numLeftCols
+    then (idx1, idx2 - numLeftCols)
+    else if idx2 < numLeftCols && idx1 >= numLeftCols
+    then (idx2, idx1 - numLeftCols)
+    else (0, 0)
+extractEquiJoinKeys _ _ = (0, 0)
