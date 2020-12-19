@@ -1,0 +1,91 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.cep.Pattern
+    Description: Complex Event Processing (CEP) pattern specifications, Kleene operators, and contiguity modes.
+-}
+
+module org.plinth.cep.Pattern where
+
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.algebra.Operator
+
+--- Contiguity mode governing event matching semantics.
+data Contiguity =
+      StrictContiguity               -- Consecutive matching events must be adjacent in stream
+    | RelaxedContiguity              -- Irrelevant intermediate events are ignored (skip till next)
+    | NonDeterministicRelaxed        -- Multiple branch exploration across interleaved events
+
+derive Eq Contiguity
+derive Ord Contiguity
+
+instance Show Contiguity where
+    show StrictContiguity        = "STRICT"
+    show RelaxedContiguity       = "RELAXED"
+    show NonDeterministicRelaxed = "NON_DETERMINISTIC"
+
+--- Individual event condition in a pattern.
+data EventCondition = EventCondition {
+    conditionName :: String,
+    predicate     :: RelExpr
+}
+
+derive Eq EventCondition
+derive Ord EventCondition
+
+instance Show EventCondition where
+    show ec = ec.conditionName ++ " WHERE " ++ show ec.predicate
+
+--- Recursive pattern composition AST supporting sequence, repetition, and optionality.
+data PatternOp =
+      PatternAtom      EventCondition
+    | PatternSeq       PatternOp PatternOp
+    | PatternOneOrMore PatternOp
+    | PatternZeroOrMore PatternOp
+    | PatternOptional  PatternOp
+
+derive Eq PatternOp
+derive Ord PatternOp
+
+instance Show PatternOp where
+    show (PatternAtom c)       = c.conditionName
+    show (PatternSeq p1 p2)    = show p1 ++ " -> " ++ show p2
+    show (PatternOneOrMore p)  = "(" ++ show p ++ ")+"
+    show (PatternZeroOrMore p) = "(" ++ show p ++ ")*"
+    show (PatternOptional p)   = "(" ++ show p ++ ")?"
+
+--- Complete CEP pattern specification with time window constraints.
+data CepPattern = CepPattern {
+    patternRoot :: PatternOp,
+    contiguity  :: Contiguity,
+    windowLimit :: Duration
+}
+
+derive Eq CepPattern
+derive Ord CepPattern
+
+instance Show CepPattern where
+    show cep = "PATTERN " ++ show cep.patternRoot ++
+               " WITHIN " ++ show cep.windowLimit ++
+               " (" ++ show cep.contiguity ++ ")"
+
+--- Construct an atomic event pattern node.
+atom :: String -> RelExpr -> PatternOp
+atom name pred = PatternAtom (EventCondition name pred)
+
+--- Construct a sequential pattern: p1 -> p2.
+seqPattern :: PatternOp -> PatternOp -> PatternOp
+seqPattern p1 p2 = PatternSeq p1 p2
+
+--- Construct a Kleene plus pattern: p+.
+plusPattern :: PatternOp -> PatternOp
+plusPattern p = PatternOneOrMore p
+
+--- Construct a Kleene star pattern: p*.
+starPattern :: PatternOp -> PatternOp
+starPattern p = PatternZeroOrMore p
+
+--- Construct an optional pattern: p?.
+optionalPattern :: PatternOp -> PatternOp
+optionalPattern p = PatternOptional p
