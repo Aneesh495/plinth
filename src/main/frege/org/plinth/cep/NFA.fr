@@ -1,0 +1,136 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.cep.NFA
+    Description: Non-deterministic Finite Automaton (NFA) compilation for CEP pattern matching.
+-}
+
+module org.plinth.cep.NFA where
+
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.algebra.Operator
+import org.plinth.cep.Pattern
+
+--- Automaton state classification.
+data StateType =
+      StartState
+    | NormalState
+    | FinalState
+
+derive Eq StateType
+derive Ord StateType
+
+instance Show StateType where
+    show StartState  = "START"
+    show NormalState = "NORMAL"
+    show FinalState  = "FINAL"
+
+--- A state in the CEP NFA graph.
+data NFAState = NFAState {
+    stateId   :: Int,
+    stateName :: String,
+    stateType :: StateType
+}
+
+derive Eq NFAState
+derive Ord NFAState
+
+instance Show NFAState where
+    show s = "State(" ++ show s.stateId ++ ", " ++ s.stateName ++ ", " ++ show s.stateType ++ ")"
+
+--- Transition edge classification: Take (consumes matching event) or Ignore (skips event).
+data EdgeType =
+      TakeEdge
+    | IgnoreEdge
+
+derive Eq EdgeType
+derive Ord EdgeType
+
+instance Show EdgeType where
+    show TakeEdge   = "TAKE"
+    show IgnoreEdge = "IGNORE"
+
+--- Transition edge between two NFA states.
+data NFAEdge = NFAEdge {
+    sourceState :: Int,
+    targetState :: Int,
+    condition   :: Maybe EventCondition,
+    edgeType    :: EdgeType
+}
+
+derive Eq NFAEdge
+derive Ord NFAEdge
+
+instance Show NFAEdge where
+    show e = show e.sourceState ++ " -> " ++ show e.targetState ++ " [" ++ show e.edgeType ++ "]"
+
+--- Non-deterministic Finite Automaton representing compiled pattern.
+data NFA = NFA {
+    states       :: [NFAState],
+    edges        :: [NFAEdge],
+    startState   :: Int,
+    finalState   :: Int,
+    maxDuration  :: Duration
+}
+
+derive Eq NFA
+derive Ord NFA
+
+instance Show NFA where
+    show nfa = "NFA(states=" ++ show (length nfa.states) ++
+               ", edges=" ++ show (length nfa.edges) ++
+               ", start=" ++ show nfa.startState ++
+               ", final=" ++ show nfa.finalState ++ ")"
+
+--- Compile a CepPattern into an executable NFA.
+compilePatternToNFA :: CepPattern -> NFA
+compilePatternToNFA cep =
+    let (compiledStates, compiledEdges, startId, endId, nextId) =
+            compileOp cep.patternRoot cep.contiguity 0
+        -- Mark start and final state types
+        finalizedStates = map (finalizeState startId endId) compiledStates
+    in NFA finalizedStates compiledEdges startId endId cep.windowLimit
+  where
+    finalizeState sId fId state
+        | state.stateId == sId = state.{stateType = StartState}
+        | state.stateId == fId = state.{stateType = FinalState}
+        | otherwise            = state.{stateType = NormalState}
+
+--- Recursive compiler for pattern operators.
+--- Returns (states, edges, startId, finalId, nextFreshId).
+compileOp :: PatternOp -> Contiguity -> Int -> ([NFAState], [NFAEdge], Int, Int, Int)
+compileOp (PatternAtom cond) contiguity curId =
+    let s0 = NFAState curId cond.conditionName NormalState
+        s1 = NFAState (curId + 1) (cond.conditionName ++ "_end") NormalState
+        takeEdge = NFAEdge curId (curId + 1) (Just cond) TakeEdge
+        -- Under RelaxedContiguity, non-matching events are skipped
+        ignoreEdges = case contiguity of
+            StrictContiguity -> []
+            _                -> [NFAEdge curId curId Nothing IgnoreEdge]
+    in ([s0, s1], takeEdge : ignoreEdges, curId, curId + 1, curId + 2)
+
+compileOp (PatternSeq p1 p2) contiguity curId =
+    let (states1, edges1, start1, end1, idAfter1) = compileOp p1 contiguity curId
+        (states2, edges2, start2, end2, idAfter2) = compileOp p2 contiguity idAfter1
+        -- Connect end of p1 to start of p2 via direct epsilon/take transition
+        bridgeEdge = NFAEdge end1 start2 Nothing TakeEdge
+    in (states1 ++ states2, edges1 ++ edges2 ++ [bridgeEdge], start1, end2, idAfter2)
+
+compileOp (PatternOneOrMore p) contiguity curId =
+    let (states, edges, startId, endId, nextId) = compileOp p contiguity curId
+        -- Loopback edge for + repetition
+        loopbackEdge = NFAEdge endId startId Nothing TakeEdge
+    in (states, edges ++ [loopbackEdge], startId, endId, nextId)
+
+compileOp (PatternZeroOrMore p) contiguity curId =
+    let (states, edges, startId, endId, nextId) = compileOp p contiguity curId
+        -- Bypass edge for 0 occurrences and loopback for >0 occurrences
+        bypassEdge   = NFAEdge startId endId Nothing TakeEdge
+        loopbackEdge = NFAEdge endId startId Nothing TakeEdge
+    in (states, edges ++ [bypassEdge, loopbackEdge], startId, endId, nextId)
+
+compileOp (PatternOptional p) contiguity curId =
+    let (states, edges, startId, endId, nextId) = compileOp p contiguity curId
+        bypassEdge = NFAEdge startId endId Nothing TakeEdge
+    in (states, edges ++ [bypassEdge], startId, endId, nextId)
