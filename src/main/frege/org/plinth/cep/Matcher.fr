@@ -1,0 +1,114 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.cep.Matcher
+    Description: Active match buffer, partial pattern exploration, and temporal window expiry.
+-}
+
+module org.plinth.cep.Matcher where
+
+import frege.data.List (partition)
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.algebra.Operator
+import org.plinth.diff.Delta
+import org.plinth.cep.Pattern
+import org.plinth.cep.NFA
+
+--- An active partial match progressing through the NFA states.
+data PartialMatch = PartialMatch {
+    currentState   :: Int,
+    startTime      :: Timestamp,
+    matchedEvents  :: [(String, [Value])]
+}
+
+derive Eq PartialMatch
+derive Ord PartialMatch
+
+instance Show PartialMatch where
+    show pm = "PartialMatch(state=" ++ show pm.currentState ++
+              ", start=" ++ show pm.startTime ++
+              ", count=" ++ show (length pm.matchedEvents) ++ ")"
+
+--- A finalized, complete pattern match spanning a sequence of stream events.
+data MatchedSequence = MatchedSequence {
+    matchedEvents :: [(String, [Value])],
+    windowSpan    :: Duration
+}
+
+derive Eq MatchedSequence
+derive Ord MatchedSequence
+
+instance Show MatchedSequence where
+    show ms = "MatchedSequence(span=" ++ show ms.windowSpan ++
+              ", events=" ++ show (map fst ms.matchedEvents) ++ ")"
+
+--- Step the CEP pattern matcher forward with a single incoming stream event.
+--- Returns the updated active partial matches and any completed pattern sequences.
+stepMatcher :: NFA
+            -> [PartialMatch]
+            -> StreamEvent
+            -> ([PartialMatch], [MatchedSequence])
+stepMatcher nfa activeMatches event =
+    let (Duration maxUs) = nfa.maxDuration
+        (Timestamp eventUs) = event.timestamp
+
+        -- 1. Evict expired partial matches exceeding the time window
+        isNotExpired pm =
+            let (Timestamp sUs) = pm.startTime
+            in (eventUs - sUs) <= maxUs
+        validMatches = filter isNotExpired activeMatches
+
+        -- 2. Transition existing partial matches against the new event
+        advancedMatches = concatMap (advanceMatch nfa event) validMatches
+
+        -- 3. Attempt to spawn a new partial match starting at startState
+        newStartMatches = spawnStartMatch nfa event
+
+        allCandidates = advancedMatches ++ newStartMatches
+
+        -- 4. Separate finalized matches from in-progress matches
+        isFinal pm = pm.currentState == nfa.finalState
+        (completed, continuing) = partition isFinal allCandidates
+
+        -- Convert completed partial matches into MatchedSequence outputs
+        toMatchedSeq pm =
+            let spanDur = timeDiff event.timestamp pm.startTime
+            in MatchedSequence pm.matchedEvents spanDur
+
+        emittedMatches = map toMatchedSeq completed
+    in (continuing, emittedMatches)
+
+--- Advance a partial match along outgoing edges from its current state.
+advanceMatch :: NFA -> StreamEvent -> PartialMatch -> [PartialMatch]
+advanceMatch nfa event pm =
+    let outgoingEdges = [ e | e <- nfa.edges, e.sourceState == pm.currentState ]
+        tryEdge edge = case edge.edgeType of
+            TakeEdge -> case edge.condition of
+                Just cond ->
+                    if evalPredicate event.tuple cond.predicate
+                    then
+                        let newEvents = pm.matchedEvents ++ [(cond.conditionName, event.tuple)]
+                        in [PartialMatch edge.targetState pm.startTime newEvents]
+                    else []
+                Nothing ->
+                    -- Epsilon transition: take directly without consuming event
+                    [PartialMatch edge.targetState pm.startTime pm.matchedEvents]
+            IgnoreEdge ->
+                -- Retain current state under relaxed contiguity
+                [pm]
+    in concatMap tryEdge outgoingEdges
+
+--- Attempt to spawn a new partial match if the event satisfies start transitions.
+spawnStartMatch :: NFA -> StreamEvent -> [PartialMatch]
+spawnStartMatch nfa event =
+    let outgoingFromStart = [ e | e <- nfa.edges, e.sourceState == nfa.startState ]
+        tryStartEdge edge = case edge.condition of
+            Just cond ->
+                if evalPredicate event.tuple cond.predicate
+                then
+                    let events = [(cond.conditionName, event.tuple)]
+                    in [PartialMatch edge.targetState event.timestamp events]
+                else []
+            Nothing -> []
+    in concatMap tryStartEdge outgoingFromStart
