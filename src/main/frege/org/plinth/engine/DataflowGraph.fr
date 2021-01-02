@@ -1,0 +1,104 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.engine.DataflowGraph
+    Description: Dynamic topological dataflow graph execution topology and node dependency scheduling.
+-}
+
+module org.plinth.engine.DataflowGraph where
+
+import frege.data.List (nub)
+import frege.data.TreeMap as TM
+import org.plinth.common.Types
+import org.plinth.common.Schema
+
+--- Unique identifier for an execution node in the dataflow graph.
+newtype NodeId = NodeId Int
+
+derive Eq NodeId
+derive Ord NodeId
+
+instance Show NodeId where
+    show (NodeId n) = "Node#" ++ show n
+
+--- Directed dataflow edge transferring stream deltas between operator nodes.
+data GraphEdge = GraphEdge {
+    fromNode :: NodeId,
+    toNode   :: NodeId
+}
+
+derive Eq GraphEdge
+derive Ord GraphEdge
+
+instance Show GraphEdge where
+    show edge = show edge.fromNode ++ " -> " ++ show edge.toNode
+
+--- A directed acyclic execution graph of stream processing nodes.
+data DataflowGraph node = DataflowGraph {
+    nodes       :: TM.TreeMap NodeId node,
+    edges       :: [GraphEdge],
+    sourceNodes :: [NodeId],
+    sinkNodes   :: [NodeId],
+    nextNodeId  :: Int
+}
+
+instance Show node => Show (DataflowGraph node) where
+    show g = "DataflowGraph(nodes=" ++ show (TM.size g.nodes) ++
+             ", edges=" ++ show (length g.edges) ++ ")"
+
+--- Construct an empty dataflow graph.
+emptyGraph :: DataflowGraph node
+emptyGraph = DataflowGraph empty [] [] [] 0
+
+--- Add an execution node to the dataflow graph, returning its assigned NodeId.
+addNode :: node -> DataflowGraph node -> (NodeId, DataflowGraph node)
+addNode n g =
+    let nid = NodeId g.nextNodeId
+        updatedNodes = TM.insert nid n g.nodes
+        updatedGraph = g.{nodes = updatedNodes, nextNodeId = g.nextNodeId + 1}
+    in (nid, updatedGraph)
+
+--- Add a directed edge between two existing nodes.
+addEdge :: NodeId -> NodeId -> DataflowGraph node -> DataflowGraph node
+addEdge src dst g =
+    let newEdge = GraphEdge src dst
+    in g.{edges = newEdge : g.edges}
+
+--- Retrieve downstream consumer nodes for a given producer node.
+downstreamNodes :: NodeId -> DataflowGraph node -> [NodeId]
+downstreamNodes nid g =
+    [ edge.toNode | edge <- g.edges, edge.fromNode == nid ]
+
+--- Retrieve upstream producer nodes for a given consumer node.
+upstreamNodes :: NodeId -> DataflowGraph node -> [NodeId]
+upstreamNodes nid g =
+    [ edge.fromNode | edge <- g.edges, edge.toNode == nid ]
+
+--- Compute topological ordering of nodes using Kahn's algorithm.
+topologicalSort :: DataflowGraph node -> [NodeId]
+topologicalSort g =
+    let allNodeIds = TM.keys g.nodes
+        inDegrees = fold countInDegree (fromKeys 0 allNodeIds) g.edges
+        zeroInDegree = [ nid | nid <- allNodeIds, getInDegree nid inDegrees == 0 ]
+    in kahnLoop zeroInDegree inDegrees []
+  where
+    fromKeys defVal ks = fold (\m k -> TM.insert k defVal m) empty ks
+    
+    getInDegree nid m = case TM.lookup nid m of
+        Just d  -> d
+        Nothing -> 0
+
+    countInDegree m edge =
+        let cur = getInDegree edge.toNode m
+        in TM.insert edge.toNode (cur + 1) m
+
+    kahnLoop [] _ acc = reverse acc
+    kahnLoop (cur:queue) curInDegrees acc =
+        let successors = downstreamNodes cur g
+            decrementEdge (degMap, newZeros) succId =
+                let d = getInDegree succId degMap - 1
+                    updatedMap = TM.insert succId d degMap
+                in if d == 0
+                   then (updatedMap, succId : newZeros)
+                   else (updatedMap, newZeros)
+            (nextInDegrees, newQueueItems) = fold decrementEdge (curInDegrees, queue) successors
+        in kahnLoop newQueueItems nextInDegrees (cur : acc)
