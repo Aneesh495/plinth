@@ -1,0 +1,103 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.engine.ExecutionNode
+    Description: Stateful operator execution nodes and incremental change propagation.
+-}
+
+module org.plinth.engine.ExecutionNode where
+
+import frege.data.TreeMap as TM
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.algebra.Operator
+import org.plinth.algebra.AggregateOps
+import org.plinth.algebra.WindowOps
+import org.plinth.algebra.JoinOps
+import org.plinth.diff.ZSet
+import org.plinth.diff.Delta
+import org.plinth.diff.Integrator
+
+--- Stateful execution node types inhabiting the runtime dataflow graph.
+data ExecutionNode =
+      NodeSource {
+          streamName :: String,
+          schema     :: Schema
+      }
+    | NodeFilter {
+          predicate  :: RelExpr,
+          schema     :: Schema
+      }
+    | NodeProject {
+          expressions :: [RelExpr],
+          schema      :: Schema
+      }
+    | NodeJoin {
+          joinState   :: JoinState,
+          schema      :: Schema
+      }
+    | NodeAggregate {
+          keyIndices  :: [Int],
+          aggSpecs    :: [AggSpec],
+          groupMap    :: TM.TreeMap [Value] [AggAccumulator],
+          schema      :: Schema
+      }
+    | NodeWindow {
+          windowType  :: WindowType,
+          timeColIdx  :: Int,
+          schema      :: Schema
+      }
+    | NodeSink {
+          viewName    :: String,
+          integrator  :: StateIntegrator,
+          schema      :: Schema
+      }
+
+instance Show ExecutionNode where
+    show (NodeSource s _)      = "NodeSource(" ++ s ++ ")"
+    show (NodeFilter p _)      = "NodeFilter(" ++ show p ++ ")"
+    show (NodeProject es _)    = "NodeProject(" ++ show (length es) ++ " exprs)"
+    show (NodeJoin _ _)        = "NodeJoin"
+    show (NodeAggregate _ _ m _) = "NodeAggregate(groups=" ++ show (TM.size m) ++ ")"
+    show (NodeWindow wt _ _)   = "NodeWindow(" ++ show wt ++ ")"
+    show (NodeSink name si _)  = "NodeSink(" ++ name ++ ", rows=" ++ show (zsetSize si.currentSnapshot.relation) ++ ")"
+
+--- Retrieve the output schema of an ExecutionNode.
+nodeSchema :: ExecutionNode -> Schema
+nodeSchema (NodeSource _ s)      = s
+nodeSchema (NodeFilter _ s)      = s
+nodeSchema (NodeProject _ s)     = s
+nodeSchema (NodeJoin _ s)        = s
+nodeSchema (NodeAggregate _ _ _ s) = s
+nodeSchema (NodeWindow _ _ s)    = s
+nodeSchema (NodeSink _ _ s)      = s
+
+--- Process an incoming stream delta through an execution node, producing an updated node
+--- and an output delta to be routed downstream.
+stepNode :: ExecutionNode -> StreamDelta -> (ExecutionNode, StreamDelta)
+stepNode node delta = case node of
+    NodeSource s sch -> (node, delta)
+
+    NodeFilter pred s ->
+        let outDelta = stepFilter pred delta
+        in (NodeFilter pred s, outDelta)
+
+    NodeProject exprs s ->
+        let outDelta = stepProject exprs s delta
+        in (NodeProject exprs s, outDelta)
+
+    NodeJoin jState s ->
+        let (nextJState, outDelta) = stepDifferentialJoin jState s delta (emptyDelta s)
+        in (NodeJoin nextJState s, outDelta)
+
+    NodeAggregate keys specs curGroups s ->
+        let (nextGroups, outDelta) = stepAggregate keys specs s curGroups delta
+        in (NodeAggregate keys specs nextGroups s, outDelta)
+
+    NodeWindow wt idx s ->
+        let outDelta = stepWindowAssigner wt idx s delta
+        in (NodeWindow wt idx s, outDelta)
+
+    NodeSink name si s ->
+        let nextIntegrator = stepIntegrator si delta
+        in (NodeSink name nextIntegrator s, delta)
