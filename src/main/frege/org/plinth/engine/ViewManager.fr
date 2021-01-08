@@ -1,0 +1,80 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.engine.ViewManager
+    Description: Continuous materialized view lifecycle, index maintenance, and query serving.
+-}
+
+module org.plinth.engine.ViewManager where
+
+import frege.data.TreeMap as TM
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.diff.ZSet
+import org.plinth.diff.Delta
+import org.plinth.diff.Differential
+
+--- A continuously maintained materialized view storing current aggregated state.
+data MaterializedView = MaterializedView {
+    viewName        :: String,
+    schema          :: Schema,
+    currentSnapshot :: StreamSnapshot,
+    totalUpdates    :: Long,
+    lastModified    :: Timestamp
+}
+
+derive Eq MaterializedView
+derive Ord MaterializedView
+
+instance Show MaterializedView where
+    show mv = "MaterializedView(name=" ++ mv.viewName ++
+              ", rows=" ++ show (zsetSize mv.currentSnapshot.relation) ++
+              ", updates=" ++ show mv.totalUpdates ++ ")"
+
+--- Manager coordinating all active materialized views across the streaming engine.
+data ViewManager = ViewManager {
+    views :: TM.TreeMap String MaterializedView
+}
+
+--- Construct an empty ViewManager.
+emptyViewManager :: ViewManager
+emptyViewManager = ViewManager empty
+
+--- Register a new materialized view.
+registerView :: String -> Schema -> ViewManager -> ViewManager
+registerView name s vm =
+    let newView = MaterializedView name s (emptySnapshot s) 0L epochZero
+    in ViewManager (TM.insert name newView vm.views)
+
+--- Apply an incremental stream delta to an existing materialized view.
+updateView :: String -> StreamDelta -> ViewManager -> ViewManager
+updateView name delta vm = case TM.lookup name vm.views of
+    Just mv ->
+        let nextSnapshot = applyDelta mv.currentSnapshot delta
+            nextUpdates  = mv.totalUpdates + 1L
+            nextModified = max mv.lastModified delta.maxTimestamp
+            updatedView  = MaterializedView name mv.schema nextSnapshot nextUpdates nextModified
+        in ViewManager (TM.insert name updatedView vm.views)
+    Nothing -> vm
+
+--- Query all current positive rows from a materialized view.
+queryViewRows :: String -> ViewManager -> Maybe [[Value]]
+queryViewRows name vm = case TM.lookup name vm.views of
+    Just mv -> Just [ t | (t, w) <- toEntries mv.currentSnapshot.relation, w > 0L ]
+    Nothing -> Nothing
+
+--- Query the full weighted Z-Set of a materialized view.
+queryViewZSet :: String -> ViewManager -> Maybe (ZSet [Value])
+queryViewZSet name vm = case TM.lookup name vm.views of
+    Just mv -> Just mv.currentSnapshot.relation
+    Nothing -> Nothing
+
+--- Retrieve performance metrics (rowCount, totalUpdates, lastModified) for a view.
+getViewMetrics :: String -> ViewManager -> Maybe (Int, Long, Timestamp)
+getViewMetrics name vm = case TM.lookup name vm.views of
+    Just mv -> Just (zsetSize mv.currentSnapshot.relation, mv.totalUpdates, mv.lastModified)
+    Nothing -> Nothing
+
+--- List names of all registered materialized views.
+listViews :: ViewManager -> [String]
+listViews vm = TM.keys vm.views
