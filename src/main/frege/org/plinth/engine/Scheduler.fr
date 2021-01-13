@@ -1,0 +1,98 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.engine.Scheduler
+    Description: Priority event scheduling, queue dispatching, and backpressure coordination.
+-}
+
+module org.plinth.engine.Scheduler where
+
+import org.plinth.common.Types
+import org.plinth.diff.Delta
+import org.plinth.engine.DataflowGraph
+
+--- Task priority levels for stream scheduling.
+data Priority =
+      PriorityHigh      -- Watermarks, barrier snapshots, and control events
+    | PriorityNormal    -- Retractions and standard delta propagation
+    | PriorityLow       -- Bulk ingest and backfill batches
+
+derive Eq Priority
+derive Ord Priority
+
+instance Show Priority where
+    show PriorityHigh   = "HIGH"
+    show PriorityNormal = "NORMAL"
+    show PriorityLow    = "LOW"
+
+--- A scheduled delta dispatch task destined for an execution node.
+data ScheduledTask = ScheduledTask {
+    priority   :: Priority,
+    targetNode :: NodeId,
+    delta      :: StreamDelta
+}
+
+instance Show ScheduledTask where
+    show task = "Task(priority=" ++ show task.priority ++
+                ", target=" ++ show task.targetNode ++
+                ", items=" ++ show (deltaCardinality task.delta) ++ ")"
+
+--- Three-tiered priority queue for deterministic low-latency dispatch.
+data TaskQueue = TaskQueue {
+    highQueue   :: [ScheduledTask],
+    normalQueue :: [ScheduledTask],
+    lowQueue    :: [ScheduledTask]
+}
+
+instance Show TaskQueue where
+    show q = "TaskQueue(high=" ++ show (length q.highQueue) ++
+             ", normal=" ++ show (length q.normalQueue) ++
+             ", low=" ++ show (length q.lowQueue) ++ ")"
+
+--- Construct an empty task queue.
+emptyTaskQueue :: TaskQueue
+emptyTaskQueue = TaskQueue [] [] []
+
+--- Enqueue a task according to its assigned priority.
+enqueueTask :: ScheduledTask -> TaskQueue -> TaskQueue
+enqueueTask task q = case task.priority of
+    PriorityHigh   -> q.{highQueue = q.highQueue ++ [task]}
+    PriorityNormal -> q.{normalQueue = q.normalQueue ++ [task]}
+    PriorityLow    -> q.{lowQueue = q.lowQueue ++ [task]}
+
+--- Dequeue the highest-priority pending task.
+dequeueTask :: TaskQueue -> Maybe (ScheduledTask, TaskQueue)
+dequeueTask q = case q.highQueue of
+    (t:ts) -> Just (t, q.{highQueue = ts})
+    []     -> case q.normalQueue of
+        (t:ts) -> Just (t, q.{normalQueue = ts})
+        []     -> case q.lowQueue of
+            (t:ts) -> Just (t, q.{lowQueue = ts})
+            []     -> Nothing
+
+--- Total pending task count in queue.
+totalPendingTasks :: TaskQueue -> Int
+totalPendingTasks q = length q.highQueue + length q.normalQueue + length q.lowQueue
+
+--- Check if task queue is empty.
+isQueueEmpty :: TaskQueue -> Bool
+isQueueEmpty q = null q.highQueue && null q.normalQueue && null q.lowQueue
+
+--- Backpressure monitoring state.
+data BackpressureStatus =
+      BackpressureOk
+    | BackpressureThrottled { queueSize :: Int, threshold :: Int }
+
+derive Eq BackpressureStatus
+derive Ord BackpressureStatus
+
+instance Show BackpressureStatus where
+    show BackpressureOk = "NORMAL"
+    show (BackpressureThrottled sz th) = "THROTTLED(" ++ show sz ++ " >= " ++ show th ++ ")"
+
+--- Assess backpressure state against a high-watermark threshold.
+checkBackpressure :: Int -> TaskQueue -> BackpressureStatus
+checkBackpressure threshold q =
+    let sz = totalPendingTasks q
+    in if sz >= threshold
+       then BackpressureThrottled sz threshold
+       else BackpressureOk
