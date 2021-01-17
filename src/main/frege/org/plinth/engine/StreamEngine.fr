@@ -1,0 +1,178 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.engine.StreamEngine
+    Description: Core streaming engine coordinator, dynamic pipeline deployment, and continuous query execution.
+-}
+
+module org.plinth.engine.StreamEngine where
+
+import frege.data.TreeMap as TM
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.diff.ZSet
+import org.plinth.diff.Delta
+import org.plinth.diff.Integrator
+import org.plinth.sql.AST
+import org.plinth.sql.TypeChecker
+import org.plinth.sql.PlanBuilder
+import org.plinth.optimizer.LogicalPlan
+import org.plinth.optimizer.PhysicalPlan
+import org.plinth.engine.DataflowGraph
+import org.plinth.engine.ExecutionNode
+import org.plinth.engine.ViewManager
+import org.plinth.engine.Scheduler
+import org.plinth.algebra.JoinOps
+
+--- Central coordinator holding engine catalog, dataflow topology, views, and dispatch queues.
+data StreamEngine = StreamEngine {
+    catalog     :: Catalog,
+    graph       :: DataflowGraph ExecutionNode,
+    viewManager :: ViewManager,
+    streamNodes :: TM.TreeMap String [NodeId], -- Maps stream name to source NodeIds in graph
+    taskQueue   :: TaskQueue,
+    totalDeltas :: Long
+}
+
+instance Show StreamEngine where
+    show se = "StreamEngine(streams=" ++ show (TM.keys se.streamNodes) ++
+              ", views=" ++ show (listViews se.viewManager) ++
+              ", deltasProcessed=" ++ show se.totalDeltas ++ ")"
+
+--- Construct a clean initial StreamEngine instance.
+emptyEngine :: StreamEngine
+emptyEngine = StreamEngine emptyCatalog emptyGraph emptyViewManager empty emptyTaskQueue 0L
+
+--- Register a stream schema in the engine.
+defineStream :: String -> Schema -> StreamEngine -> StreamEngine
+defineStream name schema eng =
+    let updatedCatalog = registerStream name schema eng.catalog
+        sourceNode = NodeSource name schema
+        (nid, updatedGraph) = addNode sourceNode eng.graph
+        updatedStreamNodes = TM.insert name [nid] eng.streamNodes
+    in eng.{catalog = updatedCatalog, graph = updatedGraph, streamNodes = updatedStreamNodes}
+
+--- Deploy a continuous query as a Materialized View into the live dataflow topology.
+deployContinuousQuery :: String -> SelectStmt -> StreamEngine -> Either String StreamEngine
+deployContinuousQuery viewName stmt eng = do
+    -- 1. Build verified logical plan
+    lPlan <- buildPlan eng.catalog stmt
+    -- 2. Convert to physical execution plan
+    let pPlan = toPhysicalPlan lPlan
+    -- 3. Materialize view definition
+    let outSchema = physicalSchema pPlan
+        updatedViewMgr = registerView viewName outSchema eng.viewManager
+    -- 4. Deploy physical plan nodes into the active graph
+    (sinkNodeId, updatedGraph, streamBindings) <- deployPhysicalNodes pPlan viewName outSchema eng.graph eng.streamNodes
+    -- 5. Register sink node in catalog as a queryable view
+    let updatedCatalog = registerStream viewName outSchema eng.catalog
+    Right eng.{catalog = updatedCatalog, graph = updatedGraph, viewManager = updatedViewMgr, streamNodes = streamBindings}
+
+--- Deploy physical operators into the dataflow graph and attach edges.
+deployPhysicalNodes :: PhysicalPlan
+                    -> String
+                    -> Schema
+                    -> DataflowGraph ExecutionNode
+                    -> TM.TreeMap String [NodeId]
+                    -> Either String (NodeId, DataflowGraph ExecutionNode, TM.TreeMap String [NodeId])
+deployPhysicalNodes (PhysicalScan (StreamId sName) s _ _) viewName outSchema g streamBindings =
+    case TM.lookup sName streamBindings of
+        Just (srcId:_) ->
+            -- Attach sink node to existing stream source
+            let sinkNode = NodeSink viewName (makeIntegrator outSchema) outSchema
+                (sinkId, g1) = addNode sinkNode g
+                g2 = addEdge srcId sinkId g1
+            in Right (sinkId, g2, streamBindings)
+        _ ->
+            let srcNode = NodeSource sName s
+                (srcId, g1) = addNode srcNode g
+                sinkNode = NodeSink viewName (makeIntegrator outSchema) outSchema
+                (sinkId, g2) = addNode sinkNode g1
+                g3 = addEdge srcId sinkId g2
+                updatedBindings = TM.insert sName [srcId] streamBindings
+            in Right (sinkId, g3, updatedBindings)
+
+deployPhysicalNodes (PhysicalFilter inp pred) viewName outSchema g streamBindings = do
+    (inpId, g1, b1) <- deployPhysicalNodes inp viewName (physicalSchema inp) g streamBindings
+    let filterNode = NodeFilter pred (physicalSchema inp)
+        (fId, g2) = addNode filterNode g1
+        g3 = addEdge inpId fId g2
+    Right (fId, g3, b1)
+
+deployPhysicalNodes (PhysicalProject inp exprs s) viewName outSchema g streamBindings = do
+    (inpId, g1, b1) <- deployPhysicalNodes inp viewName (physicalSchema inp) g streamBindings
+    let projectNode = NodeProject exprs s
+        (pId, g2) = addNode projectNode g1
+        g3 = addEdge inpId pId g2
+    Right (pId, g3, b1)
+
+deployPhysicalNodes (PhysicalAggregate inp keys specs s) viewName outSchema g streamBindings = do
+    (inpId, g1, b1) <- deployPhysicalNodes inp viewName (physicalSchema inp) g streamBindings
+    let aggNode = NodeAggregate keys specs empty s
+        (aId, g2) = addNode aggNode g1
+        g3 = addEdge inpId aId g2
+        sinkNode = NodeSink viewName (makeIntegrator s) s
+        (sinkId, g4) = addNode sinkNode g3
+        g5 = addEdge aId sinkId g4
+    Right (sinkId, g5, b1)
+
+deployPhysicalNodes (PhysicalWindow inp wt idx s) viewName outSchema g streamBindings = do
+    (inpId, g1, b1) <- deployPhysicalNodes inp viewName (physicalSchema inp) g streamBindings
+    let winNode = NodeWindow wt idx s
+        (wId, g2) = addNode winNode g1
+        g3 = addEdge inpId wId g2
+    Right (wId, g3, b1)
+
+deployPhysicalNodes (PhysicalJoin jt l r lKey rKey s) viewName outSchema g streamBindings = do
+    (lId, g1, b1) <- deployPhysicalNodes l viewName (physicalSchema l) g streamBindings
+    (rId, g2, b2) <- deployPhysicalNodes r viewName (physicalSchema r) g1 b1
+    let joinState = makeJoinState lKey rKey
+        joinNode  = NodeJoin joinState s
+        (jId, g3) = addNode joinNode g2
+        g4 = addEdge lId jId g3
+        g5 = addEdge rId jId g4
+    Right (jId, g5, b2)
+
+--- Ingest a stream delta into a named stream and propagate changes through the topological pipeline.
+ingestDelta :: String -> StreamDelta -> StreamEngine -> StreamEngine
+ingestDelta streamName delta eng =
+    case TM.lookup streamName eng.streamNodes of
+        Nothing -> eng -- Stream not bound
+        Just nids ->
+            -- Enqueue initial tasks for matching stream source nodes
+            let initTasks = [ ScheduledTask PriorityNormal nid delta | nid <- nids ]
+                q0 = fold (\q t -> enqueueTask t q) eng.taskQueue initTasks
+            in runPipeline eng.{taskQueue = q0, totalDeltas = eng.totalDeltas + 1L}
+
+--- Drain the task queue and propagate deltas along dataflow edges until quiet.
+runPipeline :: StreamEngine -> StreamEngine
+runPipeline eng = case dequeueTask eng.taskQueue of
+    Nothing -> eng -- Pipeline fully drained and quiesced
+    Just (task, nextQueue) ->
+        let curGraph = eng.graph
+        in case TM.lookup task.targetNode curGraph.nodes of
+            Nothing -> runPipeline eng.{taskQueue = nextQueue}
+            Just execNode ->
+                let (steppedNode, outputDelta) = stepNode execNode task.delta
+                    updatedNodes = TM.insert task.targetNode steppedNode curGraph.nodes
+                    updatedGraph = curGraph.{nodes = updatedNodes}
+
+                    -- If this was a sink node, update the corresponding MaterializedView
+                    updatedViewMgr = case steppedNode of
+                        NodeSink vName si _ -> updateView vName outputDelta eng.viewManager
+                        _                   -> eng.viewManager
+
+                    -- If output delta has active changes, forward to downstream nodes
+                    downstreamIds = downstreamNodes task.targetNode updatedGraph
+                    forwardTasks =
+                        if isDeltaEmpty outputDelta
+                        then []
+                        else [ ScheduledTask PriorityNormal dId outputDelta | dId <- downstreamIds ]
+
+                    enqueuedQueue = fold (\q t -> enqueueTask t q) nextQueue forwardTasks
+                    nextEngine = eng.{graph = updatedGraph, viewManager = updatedViewMgr, taskQueue = enqueuedQueue}
+                in runPipeline nextEngine
+
+--- Query the active state of a continuous materialized view.
+queryView :: String -> StreamEngine -> Maybe [[Value]]
+queryView viewName eng = queryViewRows viewName eng.viewManager
