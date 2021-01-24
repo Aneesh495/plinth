@@ -1,0 +1,104 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.storage.WALRecord
+    Description: Log-structured Write-Ahead Log (WAL) record framing, serialization, and CRC-32C verification.
+-}
+
+module org.plinth.storage.WALRecord where
+
+import frege.data.Bits
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.diff.Delta
+
+--- Monotonic Log Sequence Number.
+newtype LSN = LSN Long
+
+derive Eq LSN
+derive Ord LSN
+
+instance Show LSN where
+    show (LSN l) = "lsn#" ++ show l
+
+--- WAL Record payload classification.
+data WALRecordType =
+      WalInsert
+    | WalCheckpoint
+    | WalSchemaDef
+    | WalViewDef
+
+derive Eq WALRecordType
+derive Ord WALRecordType
+
+instance Show WALRecordType where
+    show WalInsert     = "INSERT"
+    show WalCheckpoint = "CHECKPOINT"
+    show WalSchemaDef  = "SCHEMA_DEF"
+    show WalViewDef    = "VIEW_DEF"
+
+--- A structured WAL frame recorded to append-only disk storage.
+data WALRecord = WALRecord {
+    lsn       :: LSN,
+    recType   :: WALRecordType,
+    timestamp :: Timestamp,
+    streamId  :: String,
+    payload   :: [String],   -- Encoded string representation of values/definitions
+    checksum  :: Int         -- CRC-32C checksum over header and payload
+}
+
+derive Eq WALRecord
+derive Ord WALRecord
+
+instance Show WALRecord where
+    show r = "WALRecord(" ++ show r.lsn ++
+             ", type=" ++ show r.recType ++
+             ", stream=" ++ r.streamId ++
+             ", items=" ++ show (length r.payload) ++
+             ", crc=" ++ show r.checksum ++ ")"
+
+--- Construct a WAL insert record.
+makeWalInsert :: LSN -> Timestamp -> String -> [[Value]] -> WALRecord
+makeWalInsert seqNum ts sName rows =
+    let encodedRows = map (joined "\t" . map show) rows
+        crc = computeWalCRC (show seqNum ++ sName ++ joined "\n" encodedRows)
+    in WALRecord seqNum WalInsert ts sName encodedRows crc
+
+--- Construct a WAL checkpoint record.
+makeWalCheckpoint :: LSN -> Timestamp -> WALRecord
+makeWalCheckpoint seqNum ts =
+    let crc = computeWalCRC ("CHECKPOINT" ++ show seqNum)
+    in WALRecord seqNum WalCheckpoint ts "" [] crc
+
+--- Compute Castagnoli CRC-32C polynomial hash (0x82F63B78 reflected).
+computeWalCRC :: String -> Int
+computeWalCRC str =
+    let bytes = toList str
+        crc0  = 0xFFFFFFFF
+        crcN  = fold stepCRC crc0 bytes
+        finalCRC = crcN `xor` 0xFFFFFFFF
+    in finalCRC
+  where
+    stepCRC :: Int -> Char -> Int
+    stepCRC curCrc ch =
+        let b = ord ch .&. 0xFF
+            idx = (curCrc `xor` b) .&. 0xFF
+            tableEntry = crcTableLookup idx
+        in (curCrc `shiftR` 8) `xor` tableEntry
+
+--- CRC-32C lookup table computation.
+crcTableLookup :: Int -> Int
+crcTableLookup byteVal = loop 8 byteVal where
+    polynomial = 0x82F63B78
+    loop 0 entry = entry
+    loop n entry =
+        let next = if (entry .&. 1) /= 0
+                   then (entry `shiftR` 1) `xor` polynomial
+                   else entry `shiftR` 1
+        in loop (n - 1) next
+
+--- Verify integrity of a WAL record by recomputing and comparing its CRC-32C checksum.
+verifyWalRecord :: WALRecord -> Bool
+verifyWalRecord r =
+    let expectedCRC = computeWalCRC (show r.lsn ++ r.streamId ++ joined "\n" r.payload)
+    in r.checksum == expectedCRC
