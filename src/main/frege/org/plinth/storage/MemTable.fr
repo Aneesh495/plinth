@@ -1,0 +1,77 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.storage.MemTable
+    Description: In-memory ordered buffer with primary key indexing and range scanning.
+-}
+
+module org.plinth.storage.MemTable where
+
+import frege.data.TreeMap as TM
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.vector.VectorBatch
+
+--- An in-memory sorted write buffer maintaining active stream rows ordered by primary key.
+data MemTable = MemTable {
+    tableId       :: Int,
+    schema        :: Schema,
+    primaryKeyIdx :: Int,
+    entries       :: TM.TreeMap Value [Value],
+    byteSize      :: Long,
+    minTimestamp  :: Timestamp,
+    maxTimestamp  :: Timestamp
+}
+
+instance Eq MemTable where
+    m1 == m2 = m1.tableId == m2.tableId && TM.each m1.entries == TM.each m2.entries
+    hashCode m = m.tableId * 31 + hashCode m.byteSize
+
+instance Ord MemTable where
+    m1 <=> m2 = m1.tableId <=> m2.tableId
+
+instance Show MemTable where
+    show mt = "MemTable(id=" ++ show mt.tableId ++
+              ", rows=" ++ show (TM.size mt.entries) ++
+              ", bytes=" ++ show mt.byteSize ++
+              ", span=[" ++ show mt.minTimestamp ++ ", " ++ show mt.maxTimestamp ++ "])"
+
+--- Construct a new empty MemTable for a stream schema with designated primary key column.
+makeMemTable :: Int -> Schema -> Int -> MemTable
+makeMemTable tId s pkIdx =
+    MemTable tId s pkIdx empty 0L epochMax epochZero
+
+--- Insert a row tuple into the MemTable, updating size and timestamp boundaries.
+insertRow :: [Value] -> Timestamp -> MemTable -> MemTable
+insertRow tuple ts mt =
+    let pkVal = if mt.primaryKeyIdx >= 0 && mt.primaryKeyIdx < length tuple
+                then tuple !! mt.primaryKeyIdx
+                else ValLong (fromIntegral (TM.size mt.entries) :: Long)
+        rowBytes = fromIntegral (length tuple * 8) :: Long
+        updatedEntries = TM.insert pkVal tuple mt.entries
+        newMinTs = min mt.minTimestamp ts
+        newMaxTs = max mt.maxTimestamp ts
+    in MemTable mt.tableId mt.schema mt.primaryKeyIdx updatedEntries (mt.byteSize + rowBytes) newMinTs newMaxTs
+
+--- Point lookup by primary key value.
+lookupKey :: Value -> MemTable -> Maybe [Value]
+lookupKey k mt = TM.lookup k mt.entries
+
+--- Inclusive range scan between lowKey and highKey.
+rangeScan :: Value -> Value -> MemTable -> [[Value]]
+rangeScan lowKey highKey mt =
+    let allEntries = TM.each mt.entries
+        inRange (k, _) = k >= lowKey && k <= highKey
+    in [ tuple | (k, tuple) <- allEntries, inRange (k, tuple) ]
+
+--- Retrieve all active rows in primary key sort order.
+allRows :: MemTable -> [[Value]]
+allRows mt = map snd (TM.each mt.entries)
+
+--- Convert MemTable contents into a columnar VectorBatch for compaction or SSTable flushing.
+flushToBatch :: MemTable -> VectorBatch
+flushToBatch mt = fromRows mt.schema (allRows mt)
+
+--- Check if the MemTable exceeds a byte-size flush threshold.
+isFlushReady :: Long -> MemTable -> Bool
+isFlushReady thresholdBytes mt = mt.byteSize >= thresholdBytes
