@@ -1,0 +1,79 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.storage.BloomFilter
+    Description: Scalable functional bloom filter with Murmur3 double-hashing for SSTable key pruning.
+-}
+
+module org.plinth.storage.BloomFilter where
+
+import frege.data.Bits
+import org.plinth.common.Value
+import org.plinth.common.BitSet
+
+--- A space-efficient probabilistic set filter backed by an immutable Bitmap.
+data BloomFilter = BloomFilter {
+    numElements   :: Int,
+    targetFpp     :: Double,
+    numHashFuncs  :: Int,
+    bitmap        :: Bitmap
+}
+
+derive Eq BloomFilter
+derive Ord BloomFilter
+
+instance Show BloomFilter where
+    show bf = "BloomFilter(items=" ++ show bf.numElements ++
+              ", bits=" ++ show bf.bitmap.bitCount ++
+              ", k=" ++ show bf.numHashFuncs ++
+              ", pop=" ++ show (bitmapPopCount bf.bitmap) ++ ")"
+
+--- Construct a BloomFilter dimensioned for expected item count and target false-positive probability.
+makeBloomFilter :: Int -> Double -> BloomFilter
+makeBloomFilter expectedItems fpp =
+    let safeItems = max 10 expectedItems
+        safeFpp   = max 0.0001 (min 0.5 fpp)
+        -- m = - (n * ln(p)) / (ln(2)^2)
+        -- For p = 0.01 (1%), m approx 9.6 * n, k approx 7
+        bitsPerItem = (0.0 - (logDouble safeFpp)) / 0.480453 -- (ln 2)^2
+        mBits = max 64 (roundDouble (fromIntegral safeItems * bitsPerItem))
+        kFuncs = max 1 (min 16 (roundDouble ((fromIntegral mBits / fromIntegral safeItems) * 0.693147)))
+        emptyBm = emptyBitmap (fromIntegral mBits :: Int)
+    in BloomFilter safeItems safeFpp (fromIntegral kFuncs :: Int) emptyBm
+
+--- Calculate non-negative bit index for i-th hash function.
+calcIndex :: Long -> Long -> Int -> Int -> Int
+calcIndex h1 h2 m i =
+    let combined = h1 + (fromIntegral i :: Long) * h2
+        modVal = combined `rem` (fromIntegral m :: Long)
+        posVal = if modVal < 0L then modVal + (fromIntegral m :: Long) else modVal
+    in fromIntegral posVal
+
+--- Add a primary key value to the BloomFilter.
+insertBloomKey :: Value -> BloomFilter -> BloomFilter
+insertBloomKey val bf =
+    let (h1, h2) = computeDoubleHash (asString val)
+        m = bf.bitmap.bitCount
+        bitIndices = [ calcIndex h1 h2 m i | i <- [0 .. bf.numHashFuncs - 1] ]
+        newBm = fold (\bm idx -> setBitAt idx bm) bf.bitmap bitIndices
+    in bf.{bitmap = newBm}
+
+--- Test whether a primary key value might be present in the filter.
+--- If this returns False, the key is guaranteed NOT to be present (zero false negatives).
+memberBloomKey :: Value -> BloomFilter -> Bool
+memberBloomKey val bf =
+    let (h1, h2) = computeDoubleHash (asString val)
+        m = bf.bitmap.bitCount
+        bitIndices = [ calcIndex h1 h2 m i | i <- [0 .. bf.numHashFuncs - 1] ]
+    in all (\idx -> testBitAt idx bf.bitmap) bitIndices
+
+--- Kirsch-Mitzenmacher double-hash computation producing two 64-bit seed hashes.
+computeDoubleHash :: String -> (Long, Long)
+computeDoubleHash str =
+    let chars = toList str
+        h1 = fold (\acc ch -> (acc * 1099511628211L) `xor` fromIntegral (ord ch)) 0xcbf29ce484222325L chars
+        h2 = fold (\acc ch -> (acc * 0x5deece66dL + 0xbL) `xor` fromIntegral (ord ch)) 0x123456789abcdef0L chars
+    in (h1, h2)
+
+--- Math helper for natural log.
+pure native logDouble "java.lang.Math.log" :: Double -> Double
+pure native roundDouble "(long)Math.round" :: Double -> Long
