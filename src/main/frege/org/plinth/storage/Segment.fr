@@ -1,0 +1,137 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.storage.Segment
+    Description: Immutable columnar SSTable segment files with two-level sparse indexing and zone maps.
+-}
+
+module org.plinth.storage.Segment where
+
+import frege.data.List (find)
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.algebra.Operator
+import org.plinth.vector.ColumnVector
+import org.plinth.vector.VectorBatch
+import org.plinth.vector.Compression
+import org.plinth.storage.BloomFilter
+
+--- Sparse index entry for a block of sorted keys.
+data BlockIndexEntry = BlockIndexEntry {
+    blockId   :: Int,
+    firstKey  :: Value,
+    lastKey   :: Value,
+    rowCount  :: Int
+}
+
+derive Eq BlockIndexEntry
+derive Ord BlockIndexEntry
+
+instance Show BlockIndexEntry where
+    show b = "Block#" ++ show b.blockId ++ "[" ++ show b.firstKey ++ " .. " ++ show b.lastKey ++ "]"
+
+--- Zone map storing min and max values for a column chunk to enable pushdown pruning.
+data ZoneMap = ZoneMap {
+    colIndex :: Int,
+    minValue :: Value,
+    maxValue :: Value
+}
+
+derive Eq ZoneMap
+derive Ord ZoneMap
+
+instance Show ZoneMap where
+    show zm = "ZoneMap($" ++ show zm.colIndex ++ ": [" ++ show zm.minValue ++ " .. " ++ show zm.maxValue ++ "])"
+
+--- An immutable columnar SSTable segment.
+data Segment = Segment {
+    segmentId    :: Long,
+    schema       :: Schema,
+    rowCount     :: Int,
+    minKey       :: Value,
+    maxKey       :: Value,
+    minTime      :: Timestamp,
+    maxTime      :: Timestamp,
+    bloom        :: BloomFilter,
+    blockIndex   :: [BlockIndexEntry],
+    zoneMaps     :: [ZoneMap],
+    compressed   :: [CompressedColumn]
+}
+
+derive Eq Segment
+derive Ord Segment
+
+instance Show Segment where
+    show seg = "Segment(id=" ++ show seg.segmentId ++
+               ", rows=" ++ show seg.rowCount ++
+               ", keySpan=[" ++ show seg.minKey ++ " .. " ++ show seg.maxKey ++ "]" ++
+               ", blocks=" ++ show (length seg.blockIndex) ++ ")"
+
+--- Construct a new immutable Segment from a sorted VectorBatch and primary key column index.
+makeSegment :: Long -> VectorBatch -> Int -> Segment
+makeSegment sId vb pkColIdx =
+    let nRows = vb.rowCount
+        rows  = toRows vb
+        keys  = [ r !! pkColIdx | r <- rows, pkColIdx >= 0, pkColIdx < length r ]
+        minK  = if null keys then ValNull else head keys
+        maxK  = if null keys then ValNull else last keys
+        -- Build bloom filter over primary keys
+        emptyBf = makeBloomFilter (max 100 nRows) 0.01
+        segBloom = fold (\bf k -> insertBloomKey k bf) emptyBf keys
+        -- Build zone maps for each column
+        zMaps = [ buildZoneMap cIdx col | (cIdx, col) <- zip [0..] vb.columns ]
+        -- Build sparse block index (grouping every 64 rows into a block)
+        bIndex = buildBlockIndex keys 64
+        -- Compress column vectors
+        compCols = map autoCompress vb.columns
+    in Segment sId vb.schema nRows minK maxK epochZero epochZero segBloom bIndex zMaps compCols
+
+--- Build zone map (min, max) for a column vector.
+buildZoneMap :: Int -> ColumnVector -> ZoneMap
+buildZoneMap cIdx cv =
+    let vals = filter (not . isNull) (toValues cv)
+        minV = if null vals then ValNull else minimum vals
+        maxV = if null vals then ValNull else maximum vals
+    in ZoneMap cIdx minV maxV
+
+--- Build sparse block index over sorted keys.
+buildBlockIndex :: [Value] -> Int -> [BlockIndexEntry]
+buildBlockIndex allKeys blockSize = go 0 allKeys where
+    go _ [] = []
+    go bId ks =
+        let chunk = take blockSize ks
+            remKs = drop blockSize ks
+            entry = BlockIndexEntry bId (head chunk) (last chunk) (length chunk)
+        in entry : go (bId + 1) remKs
+
+--- Point lookup for a primary key in the segment.
+pointLookup :: Value -> Segment -> Maybe [Value]
+pointLookup targetKey seg
+    | targetKey < seg.minKey || targetKey > seg.maxKey = Nothing
+    | not (memberBloomKey targetKey seg.bloom)         = Nothing
+    | otherwise =
+        -- Find matching block and search decompressed rows
+        let matchingBlocks = [ b | b <- seg.blockIndex, targetKey >= b.firstKey && targetKey <= b.lastKey ]
+        in if null matchingBlocks
+           then Nothing
+           else
+               let decompressedCols = map decompress seg.compressed
+                   decompBatch = VectorBatch seg.schema seg.rowCount decompressedCols
+                   allRows = toRows decompBatch
+               in find (\r -> r !! 0 == targetKey) allRows
+
+--- Evaluate whether a segment can be pruned using its zone maps against a filter expression.
+canPruneSegment :: RelExpr -> Segment -> Bool
+canPruneSegment (ExprBinary OpEq (ExprColRef idx) (ExprLiteral lit)) seg =
+    case find (\zm -> zm.colIndex == idx) seg.zoneMaps of
+        Just zm -> lit < zm.minValue || lit > zm.maxValue
+        Nothing -> false
+canPruneSegment (ExprBinary OpGt (ExprColRef idx) (ExprLiteral lit)) seg =
+    case find (\zm -> zm.colIndex == idx) seg.zoneMaps of
+        Just zm -> seg.rowCount > 0 && zm.maxValue <= lit
+        Nothing -> false
+canPruneSegment (ExprBinary OpLt (ExprColRef idx) (ExprLiteral lit)) seg =
+    case find (\zm -> zm.colIndex == idx) seg.zoneMaps of
+        Just zm -> seg.rowCount > 0 && zm.minValue >= lit
+        Nothing -> false
+canPruneSegment _ _ = false
