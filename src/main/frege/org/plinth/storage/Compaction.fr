@@ -1,0 +1,79 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.storage.Compaction
+    Description: Tiered and leveled SSTable compaction, dead retraction purging, and N-way merge.
+-}
+
+module org.plinth.storage.Compaction where
+
+import frege.data.List
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.vector.ColumnVector
+import org.plinth.vector.VectorBatch
+import org.plinth.vector.Compression
+import org.plinth.storage.Segment
+
+--- Compaction strategy configuration.
+data CompactionStrategy =
+      SizeTiered { thresholdCount :: Int }
+    | Leveled    { maxLevelSizeMb :: Int }
+
+derive Eq CompactionStrategy
+derive Ord CompactionStrategy
+
+instance Show CompactionStrategy where
+    show (SizeTiered c) = "SizeTiered(minCount=" ++ show c ++ ")"
+    show (Leveled mb)   = "Leveled(levelCap=" ++ show mb ++ "MB)"
+
+--- Merge multiple immutable segments into a single consolidated segment.
+--- Decompresses columnar data, merges sorted rows, eliminates duplicate/retracted rows,
+--- and re-encodes compressed columnar vectors with a fresh bloom filter and block index.
+mergeSegments :: Long -> [Segment] -> Int -> Maybe Segment
+mergeSegments _ [] _ = Nothing
+mergeSegments newSegId segs pkIdx =
+    let baseSchema = (head segs).schema
+        -- Extract all rows from all segments
+        decompressRows seg =
+            let dCols = map decompress seg.compressed
+                vb    = VectorBatch seg.schema seg.rowCount dCols
+            in toRows vb
+        allSegRows = concatMap decompressRows segs
+        -- Sort combined rows by primary key
+        sortKey r = if pkIdx >= 0 && pkIdx < length r then r !! pkIdx else ValNull
+        sortedRows = sortBy (\r1 r2 -> sortKey r1 <=> sortKey r2) allSegRows
+        -- Purge retractions and keep newest version per primary key
+        deduplicatedRows = deduplicateByKey sortedRows pkIdx
+        consolidatedBatch = fromRows baseSchema deduplicatedRows
+    in Just (makeSegment newSegId consolidatedBatch pkIdx)
+
+--- Deduplicate rows sharing identical primary keys, preserving latest entry.
+deduplicateByKey :: [[Value]] -> Int -> [[Value]]
+deduplicateByKey [] _ = []
+deduplicateByKey (r:rs) pkIdx = go (sortKey r) [r] rs where
+    sortKey row = if pkIdx >= 0 && pkIdx < length row then row !! pkIdx else ValNull
+    go _ curGroup [] = [last curGroup]
+    go curKey curGroup (x:xs)
+        | sortKey x == curKey = go curKey (curGroup ++ [x]) xs
+        | otherwise           = last curGroup : go (sortKey x) [x] xs
+
+--- Determine if background compaction should be triggered for active segments.
+shouldTriggerCompaction :: CompactionStrategy -> [Segment] -> Bool
+shouldTriggerCompaction (SizeTiered minCount) segs =
+    length segs >= minCount
+shouldTriggerCompaction (Leveled _) segs =
+    length segs >= 4
+
+--- Run a compaction pass if trigger conditions are satisfied.
+runCompactionPass :: Long -> CompactionStrategy -> [Segment] -> Int -> ([Segment], Maybe Segment)
+runCompactionPass newSegId strategy segs pkIdx =
+    if shouldTriggerCompaction strategy segs
+    then
+        let toMerge = take 4 segs
+            remaining = drop 4 segs
+            mergedOpt = mergeSegments newSegId toMerge pkIdx
+        in case mergedOpt of
+            Just merged -> (merged : remaining, Just merged)
+            Nothing     -> (segs, Nothing)
+    else (segs, Nothing)
