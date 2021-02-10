@@ -1,0 +1,111 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.storage.StorageEngine
+    Description: Unified storage coordinator managing WAL, in-memory MemTables, and disk SSTables.
+-}
+
+module org.plinth.storage.StorageEngine where
+
+import frege.data.TreeMap as TM
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.vector.VectorBatch
+import org.plinth.vector.Compression (decompress)
+import org.plinth.storage.WALRecord
+import org.plinth.storage.MemTable
+import org.plinth.storage.Segment
+import org.plinth.storage.Compaction
+
+--- Unified hybrid storage engine combining in-memory active write buffers with disk SSTable segments.
+data StorageEngine = StorageEngine {
+    schema             :: Schema,
+    primaryKeyColIdx   :: Int,
+    activeMemTable     :: MemTable,
+    flushedSegments    :: [Segment],
+    walRecords         :: [WALRecord],
+    nextSegmentId      :: Long,
+    nextLSN            :: Long,
+    flushThresholdByte :: Long,
+    compactionStrategy :: CompactionStrategy
+}
+
+instance Show StorageEngine where
+    show se = "StorageEngine(schema=" ++ show se.schema ++
+              ", memRows=" ++ show (TM.size se.activeMemTable.entries) ++
+              ", segments=" ++ show (length se.flushedSegments) ++
+              ", walCount=" ++ show (length se.walRecords) ++ ")"
+
+--- Construct a new StorageEngine instance for a stream relation.
+makeStorageEngine :: Schema -> Int -> StorageEngine
+makeStorageEngine s pkIdx =
+    let initMt = makeMemTable 0 s pkIdx
+    in StorageEngine s pkIdx initMt [] [] 1L 1L (64L * 1024L * 1024L) (SizeTiered 4)
+
+--- Append a row tuple to the storage engine (WAL append + MemTable insert).
+appendRow :: [Value] -> Timestamp -> String -> StorageEngine -> StorageEngine
+appendRow tuple ts sName se =
+    let -- 1. Record to WAL
+        walRec = makeWalInsert (LSN se.nextLSN) ts sName [tuple]
+        updatedWal = walRec : se.walRecords
+        -- 2. Insert into MemTable
+        updatedMt = insertRow tuple ts se.activeMemTable
+        updatedEng = se.{ activeMemTable = updatedMt
+                        , walRecords = updatedWal
+                        , nextLSN = se.nextLSN + 1L }
+    in if isFlushReady se.flushThresholdByte updatedMt
+       then flushActiveMemTable updatedEng
+       else updatedEng
+
+--- Flush active MemTable into an immutable on-disk Segment.
+flushActiveMemTable :: StorageEngine -> StorageEngine
+flushActiveMemTable se =
+    let mt = se.activeMemTable
+    in if TM.size mt.entries == 0
+       then se
+       else
+           let batch = flushToBatch mt
+               newSeg = makeSegment se.nextSegmentId batch se.primaryKeyColIdx
+               updatedSegments = newSeg : se.flushedSegments
+               freshMt = makeMemTable (mt.tableId + 1) se.schema se.primaryKeyColIdx
+               (compactedSegs, _) = runCompactionPass (se.nextSegmentId + 1L) se.compactionStrategy updatedSegments se.primaryKeyColIdx
+               nextSegId = se.nextSegmentId + 2L
+           in se.{ activeMemTable = freshMt
+                 , flushedSegments = compactedSegs
+                 , nextSegmentId = nextSegId }
+
+--- Point lookup for a primary key across MemTable and all SSTable segments.
+queryPoint :: Value -> StorageEngine -> Maybe [Value]
+queryPoint key se =
+    -- 1. Check in-memory MemTable first (most recent)
+    case lookupKey key se.activeMemTable of
+        Just row -> Just row
+        Nothing  ->
+            -- 2. Check SSTable segments in reverse chronological order
+            searchSegments key se.flushedSegments
+  where
+    searchSegments _ [] = Nothing
+    searchSegments k (seg:rest) = case pointLookup k seg of
+        Just row -> Just row
+        Nothing  -> searchSegments k rest
+
+--- Range scan for primary keys between lowKey and highKey.
+queryRange :: Value -> Value -> StorageEngine -> [[Value]]
+queryRange lowKey highKey se =
+    let memRows = rangeScan lowKey highKey se.activeMemTable
+        segRows = concatMap (\seg ->
+            let decompCols = map decompress seg.compressed
+                vb = VectorBatch seg.schema seg.rowCount decompCols
+                rows = toRows vb
+                inRange r =
+                    let k = if se.primaryKeyColIdx >= 0 && se.primaryKeyColIdx < length r
+                            then r !! se.primaryKeyColIdx
+                            else ValNull
+                    in k >= lowKey && k <= highKey
+            in filter inRange rows) se.flushedSegments
+    in memRows ++ segRows
+
+--- Total row count currently stored across memory and segments.
+totalStoredRows :: StorageEngine -> Int
+totalStoredRows se =
+    TM.size se.activeMemTable.entries + sum (map Segment.rowCount se.flushedSegments)
