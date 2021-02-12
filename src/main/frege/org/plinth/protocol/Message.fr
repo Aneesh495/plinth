@@ -1,0 +1,142 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.protocol.Message
+    Description: PLN1 binary wire protocol message structures, opcodes, and command definitions.
+-}
+
+module org.plinth.protocol.Message where
+
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+
+--- Binary wire protocol command opcodes.
+data OpCode =
+      OpConnect
+    | OpConnectAck
+    | OpExecuteQuery
+    | OpSubscribeStream
+    | OpBatchInsert
+    | OpRowBatch
+    | OpWatermarkAdv
+    | OpAck
+    | OpError
+    | OpPing
+    | OpPong
+
+derive Eq OpCode
+derive Ord OpCode
+
+instance Show OpCode where
+    show OpConnect         = "CONNECT(0x01)"
+    show OpConnectAck      = "CONNECT_ACK(0x02)"
+    show OpExecuteQuery    = "EXECUTE_QUERY(0x03)"
+    show OpSubscribeStream = "SUBSCRIBE_STREAM(0x04)"
+    show OpBatchInsert     = "BATCH_INSERT(0x05)"
+    show OpRowBatch        = "ROW_BATCH(0x06)"
+    show OpWatermarkAdv    = "WATERMARK_ADV(0x07)"
+    show OpAck             = "ACK(0x08)"
+    show OpError           = "ERROR(0x09)"
+    show OpPing            = "PING(0x0A)"
+    show OpPong            = "PONG(0x0B)"
+
+--- Map OpCode to 1-byte wire identifier.
+opCodeToByte :: OpCode -> Int
+opCodeToByte OpConnect         = 0x01
+opCodeToByte OpConnectAck      = 0x02
+opCodeToByte OpExecuteQuery    = 0x03
+opCodeToByte OpSubscribeStream = 0x04
+opCodeToByte OpBatchInsert     = 0x05
+opCodeToByte OpRowBatch        = 0x06
+opCodeToByte OpWatermarkAdv    = 0x07
+opCodeToByte OpAck             = 0x08
+opCodeToByte OpError           = 0x09
+opCodeToByte OpPing            = 0x0A
+opCodeToByte OpPong            = 0x0B
+
+--- Parse 1-byte wire identifier into OpCode.
+byteToOpCode :: Int -> Maybe OpCode
+byteToOpCode 0x01 = Just OpConnect
+byteToOpCode 0x02 = Just OpConnectAck
+byteToOpCode 0x03 = Just OpExecuteQuery
+byteToOpCode 0x04 = Just OpSubscribeStream
+byteToOpCode 0x05 = Just OpBatchInsert
+byteToOpCode 0x06 = Just OpRowBatch
+byteToOpCode 0x07 = Just OpWatermarkAdv
+byteToOpCode 0x08 = Just OpAck
+byteToOpCode 0x09 = Just OpError
+byteToOpCode 0x0A = Just OpPing
+byteToOpCode 0x0B = Just OpPong
+byteToOpCode _    = Nothing
+
+--- Concrete typed wire messages exchanged between clients and server.
+data WireMessage =
+      MsgConnect {
+          clientName      :: String,
+          protocolVersion :: Int
+      }
+    | MsgConnectAck {
+          serverVersion   :: String,
+          sessionId       :: Long,
+          status          :: Int
+      }
+    | MsgExecuteQuery {
+          querySql        :: String
+      }
+    | MsgSubscribeStream {
+          targetName      :: String,
+          startTimestamp  :: Timestamp
+      }
+    | MsgBatchInsert {
+          streamName      :: String,
+          rows            :: [[Value]]
+      }
+    | MsgRowBatch {
+          streamName      :: String,
+          rows            :: [[Value]],
+          isEndOfStream   :: Bool
+      }
+    | MsgWatermarkAdv {
+          streamName      :: String,
+          watermark       :: Timestamp
+      }
+    | MsgAck {
+          sequenceId      :: Long,
+          message         :: String
+      }
+    | MsgError {
+          errorCode       :: Int,
+          errorMessage    :: String
+      }
+    | MsgPing
+    | MsgPong
+
+derive Eq WireMessage
+derive Ord WireMessage
+
+instance Show WireMessage where
+    show (MsgConnect c v)        = "MsgConnect(client=" ++ c ++ ", ver=" ++ show v ++ ")"
+    show (MsgConnectAck sv sid st) = "MsgConnectAck(server=" ++ sv ++ ", session=" ++ show sid ++ ")"
+    show (MsgExecuteQuery q)     = "MsgExecuteQuery(" ++ q ++ ")"
+    show (MsgSubscribeStream s t)= "MsgSubscribeStream(" ++ s ++ ", t=" ++ show t ++ ")"
+    show (MsgBatchInsert s rs)   = "MsgBatchInsert(" ++ s ++ ", rows=" ++ show (length rs) ++ ")"
+    show (MsgRowBatch s rs eos)  = "MsgRowBatch(" ++ s ++ ", rows=" ++ show (length rs) ++ ", eos=" ++ show eos ++ ")"
+    show (MsgWatermarkAdv s wm)  = "MsgWatermarkAdv(" ++ s ++ ", wm=" ++ show wm ++ ")"
+    show (MsgAck seq msg)        = "MsgAck(seq=" ++ show seq ++ ", msg=" ++ msg ++ ")"
+    show (MsgError c m)          = "MsgError(code=" ++ show c ++ ", msg=" ++ m ++ ")"
+    show MsgPing                 = "MsgPing"
+    show MsgPong                 = "MsgPong"
+
+--- Return the matching OpCode for a given WireMessage.
+messageOpCode :: WireMessage -> OpCode
+messageOpCode (MsgConnect _ _)        = OpConnect
+messageOpCode (MsgConnectAck _ _ _)   = OpConnectAck
+messageOpCode (MsgExecuteQuery _)     = OpExecuteQuery
+messageOpCode (MsgSubscribeStream _ _)= OpSubscribeStream
+messageOpCode (MsgBatchInsert _ _)    = OpBatchInsert
+messageOpCode (MsgRowBatch _ _ _)     = OpRowBatch
+messageOpCode (MsgWatermarkAdv _ _)   = OpWatermarkAdv
+messageOpCode (MsgAck _ _)            = OpAck
+messageOpCode (MsgError _ _)          = OpError
+messageOpCode MsgPing                 = OpPing
+messageOpCode MsgPong                 = OpPong
