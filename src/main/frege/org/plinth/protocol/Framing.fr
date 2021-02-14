@@ -1,0 +1,219 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.protocol.Framing
+    Description: PLN1 binary frame codec: magic headers, sequence identifiers, and CRC-32C verification.
+-}
+
+module org.plinth.protocol.Framing where
+
+import frege.data.Bits
+import org.plinth.common.Types
+import org.plinth.common.Value
+import org.plinth.protocol.Message
+import org.plinth.storage.WALRecord (computeWalCRC)
+
+--- Frame encoding flags.
+data FrameFlags = FrameFlags {
+    isCompressed :: Bool,
+    isHeartbeat  :: Bool
+}
+
+derive Eq FrameFlags
+derive Ord FrameFlags
+
+instance Show FrameFlags where
+    show f = "Flags(compressed=" ++ show f.isCompressed ++ ", hb=" ++ show f.isHeartbeat ++ ")"
+
+--- Default empty frame flags.
+defaultFlags :: FrameFlags
+defaultFlags = FrameFlags false false
+
+--- Complete binary wire frame wrapping a protocol message.
+data BinaryFrame = BinaryFrame {
+    magic       :: String,       -- Must be "PLN1"
+    opCode      :: OpCode,
+    flags       :: FrameFlags,
+    sequenceId  :: Long,
+    payloadText :: String,
+    checksum    :: Int
+}
+
+derive Eq BinaryFrame
+derive Ord BinaryFrame
+
+instance Show BinaryFrame where
+    show f = "Frame(" ++ show f.opCode ++
+             ", seq=" ++ show f.sequenceId ++
+             ", len=" ++ show (length (toList f.payloadText)) ++
+             ", crc=" ++ show f.checksum ++ ")"
+
+--- Protocol magic constant.
+plnMagic :: String
+plnMagic = "PLN1"
+
+--- Encode a WireMessage into a formatted wire frame string.
+encodeFrame :: Long -> WireMessage -> String
+encodeFrame seqNum msg =
+    let op = messageOpCode msg
+        payload = serializeMessagePayload msg
+        payloadLen = length (toList payload)
+        crc = computeWalCRC (plnMagic ++ show (opCodeToByte op) ++ show seqNum ++ payload)
+        header = plnMagic ++ ":" ++
+                 show (opCodeToByte op) ++ ":" ++
+                 show seqNum ++ ":" ++
+                 show payloadLen ++ ":" ++
+                 show crc ++ "\n"
+    in header ++ payload ++ "\n"
+
+--- Decode a raw wire frame string into a validated WireMessage.
+decodeFrame :: String -> Either String (WireMessage, Long)
+decodeFrame raw =
+    let linesList = lines raw
+    in if null linesList
+       then Left "Empty frame"
+       else
+           let headerLine = head linesList
+               bodyLines  = tail linesList
+               bodyText   = joined "\n" bodyLines
+               tokens     = splitAtColon headerLine
+           in case tokens of
+               [m, opStr, seqStr, lenStr, crcStr] ->
+                   if m /= plnMagic
+                   then Left ("Invalid protocol magic: " ++ m ++ " (expected PLN1)")
+                   else case (opStr.int, seqStr.long, lenStr.int, crcStr.int) of
+                       (Right opB, Right seqN, Right expectedLen, Right expectedCRC) ->
+                           let computedCRC = computeWalCRC (plnMagic ++ show opB ++ show seqN ++ bodyText)
+                           in if computedCRC /= expectedCRC
+                              then Left ("CRC-32C checksum mismatch in frame #" ++ show seqN)
+                              else case byteToOpCode opB of
+                                  Just op -> case deserializeMessagePayload op bodyText of
+                                      Right msg -> Right (msg, seqN)
+                                      Left err  -> Left err
+                                  Nothing -> Left ("Unknown opcode byte: " ++ show opB)
+                       _ -> Left "Malformed numeric fields in frame header"
+               _ -> Left "Malformed frame header tokens"
+
+--- Helper to split string on colon delimiter.
+splitAtColon :: String -> [String]
+splitAtColon str =
+    let chars = toList str
+        parts = splitChars ':' chars
+    in map packed parts
+  where
+    splitChars delim [] = [[]]
+    splitChars delim (c:cs)
+        | c == delim = [] : splitChars delim cs
+        | otherwise  = case splitChars delim cs of
+            (p:ps) -> (c : p) : ps
+            []     -> [[c]]
+
+--- Serialize message payload into line-delimited text for network transmission.
+serializeMessagePayload :: WireMessage -> String
+serializeMessagePayload (MsgConnect c v)          = c ++ "\t" ++ show v
+serializeMessagePayload (MsgConnectAck sv sid st) = sv ++ "\t" ++ show sid ++ "\t" ++ show st
+serializeMessagePayload (MsgExecuteQuery q)       = q
+serializeMessagePayload (MsgSubscribeStream s t)  = s ++ "\t" ++ show t
+serializeMessagePayload (MsgBatchInsert s rs)     = s ++ "\n" ++ joined "\n" (map encodeRow rs)
+serializeMessagePayload (MsgRowBatch s rs eos)    = s ++ "\t" ++ (if eos then "1" else "0") ++ "\n" ++ joined "\n" (map encodeRow rs)
+serializeMessagePayload (MsgWatermarkAdv s wm)    = s ++ "\t" ++ show wm
+serializeMessagePayload (MsgAck seq msg)          = show seq ++ "\t" ++ msg
+serializeMessagePayload (MsgError code msg)       = show code ++ "\t" ++ msg
+serializeMessagePayload MsgPing                   = "PING"
+serializeMessagePayload MsgPong                   = "PONG"
+
+--- Encode a single row of Values.
+encodeRow :: [Value] -> String
+encodeRow vs = joined "\t" (map show vs)
+
+--- Deserialize message payload text according to its OpCode.
+deserializeMessagePayload :: OpCode -> String -> Either String WireMessage
+deserializeMessagePayload OpConnect body = case splitAtTab body of
+    [c, vStr] -> case vStr.int of
+        Right v -> Right (MsgConnect c v)
+        Left _  -> Right (MsgConnect c 1)
+    _ -> Right (MsgConnect body 1)
+
+deserializeMessagePayload OpConnectAck body = case splitAtTab body of
+    [sv, sidStr, stStr] -> case (sidStr.long, stStr.int) of
+        (Right sid, Right st) -> Right (MsgConnectAck sv sid st)
+        _                     -> Right (MsgConnectAck sv 0L 0)
+    _ -> Right (MsgConnectAck "0.1.0" 0L 0)
+
+deserializeMessagePayload OpExecuteQuery body =
+    Right (MsgExecuteQuery body)
+
+deserializeMessagePayload OpSubscribeStream body = case splitAtTab body of
+    [s, tStr] -> Right (MsgSubscribeStream s epochZero)
+    _         -> Right (MsgSubscribeStream body epochZero)
+
+deserializeMessagePayload OpBatchInsert body =
+    let ls = lines body
+    in if null ls
+       then Left "Empty batch insert body"
+       else
+           let sName = head ls
+               rowLines = tail ls
+               parsedRows = map parseValueRow rowLines
+           in Right (MsgBatchInsert sName parsedRows)
+
+deserializeMessagePayload OpRowBatch body =
+    let ls = lines body
+    in if null ls
+       then Left "Empty row batch"
+       else
+           let header = head ls
+               rowLines = tail ls
+               (sName, eos) = case splitAtTab header of
+                   [s, "1"] -> (s, true)
+                   [s, _]   -> (s, false)
+                   _        -> (header, false)
+               parsedRows = map parseValueRow rowLines
+           in Right (MsgRowBatch sName parsedRows eos)
+
+deserializeMessagePayload OpWatermarkAdv body = case splitAtTab body of
+    [s, _] -> Right (MsgWatermarkAdv s epochZero)
+    _      -> Right (MsgWatermarkAdv body epochZero)
+
+deserializeMessagePayload OpAck body = case splitAtTab body of
+    [seqStr, m] -> case seqStr.long of
+        Right s -> Right (MsgAck s m)
+        _       -> Right (MsgAck 0L m)
+    _ -> Right (MsgAck 0L body)
+
+deserializeMessagePayload OpError body = case splitAtTab body of
+    [cStr, m] -> case cStr.int of
+        Right c -> Right (MsgError c m)
+        _       -> Right (MsgError 500 m)
+    _ -> Right (MsgError 500 body)
+
+deserializeMessagePayload OpPing _ = Right MsgPing
+deserializeMessagePayload OpPong _ = Right MsgPong
+
+--- Split a string by tab delimiter.
+splitAtTab :: String -> [String]
+splitAtTab str =
+    let chars = toList str
+        parts = splitChars '\t' chars
+    in map packed parts
+  where
+    splitChars delim [] = [[]]
+    splitChars delim (c:cs)
+        | c == delim = [] : splitChars delim cs
+        | otherwise  = case splitChars delim cs of
+            (p:ps) -> (c : p) : ps
+            []     -> [[c]]
+
+--- Parse a single tab-separated line into a list of Values.
+parseValueRow :: String -> [Value]
+parseValueRow line =
+    let tokens = splitAtTab line
+        parseToken tok = case tok of
+            "NULL" -> ValNull
+            "true" -> ValBool true
+            "false"-> ValBool false
+            _ -> case tok.long of
+                Right l -> ValLong l
+                Left _  -> case tok.double of
+                    Right d -> ValDouble d
+                    Left _  -> ValString tok
+    in map parseToken tokens
