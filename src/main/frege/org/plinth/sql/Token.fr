@@ -23,10 +23,10 @@ initialPos :: SourcePos
 initialPos = SourcePos 1 1
 
 --- Advance position across a single character.
-advancePos :: Char -> SourcePos -> SourcePos
-advancePos '\n' (SourcePos l _) = SourcePos (l + 1) 1
-advancePos '\t' (SourcePos l c) = SourcePos l (((c + 3) `div` 4) * 4 + 1)
-advancePos _    (SourcePos l c) = SourcePos l (c + 1)
+advancePos :: SourcePos -> Char -> SourcePos
+advancePos (SourcePos l _) '\n' = SourcePos (l + 1) 1
+advancePos (SourcePos l c) '\t' = SourcePos l (((c + 3) `div` 4) * 4 + 1)
+advancePos (SourcePos l c) _    = SourcePos l (c + 1)
 
 --- Lexical token classification for streaming SQL and DDL commands.
 data TokenKind =

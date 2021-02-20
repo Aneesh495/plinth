@@ -1,0 +1,42 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.server.Session
+    Description: Client connection session state, authentication, and continuous stream subscriptions.
+-}
+
+module org.plinth.server.Session where
+
+import frege.data.TreeMap as TM
+import org.plinth.common.Types
+
+--- State for an active client TCP connection session.
+data ClientSession = ClientSession {
+    sessionId     :: Long,
+    clientName    :: String,
+    connectedAt   :: Timestamp,
+    subscriptions :: [String] -- List of subscribed stream and view names
+}
+
+derive Eq ClientSession
+derive Ord ClientSession
+
+instance Show ClientSession where
+    show s = "Session(id=" ++ show s.sessionId ++
+             ", client=" ++ s.clientName ++
+             ", subs=" ++ show s.subscriptions ++ ")"
+
+--- Construct a new client session.
+makeSession :: Long -> String -> Timestamp -> ClientSession
+makeSession sid cName ts = ClientSession sid cName ts []
+
+--- Add a stream or materialized view subscription to the session.
+addSubscription :: String -> ClientSession -> ClientSession
+addSubscription target s =
+    if target `elem` s.subscriptions
+    then s
+    else s.{subscriptions = target : s.subscriptions}
+
+--- Remove a stream subscription from the session.
+removeSubscription :: String -> ClientSession -> ClientSession
+removeSubscription target s =
+    s.{subscriptions = filter (/= target) s.subscriptions}

@@ -63,69 +63,60 @@ deployContinuousQuery viewName stmt eng = do
     let outSchema = physicalSchema pPlan
         updatedViewMgr = registerView viewName outSchema eng.viewManager
     -- 4. Deploy physical plan nodes into the active graph
-    (sinkNodeId, updatedGraph, streamBindings) <- deployPhysicalNodes pPlan viewName outSchema eng.graph eng.streamNodes
-    -- 5. Register sink node in catalog as a queryable view
+    (rootNodeId, g1, streamBindings) <- deployPhysicalNodes pPlan eng.graph eng.streamNodes
+    -- 5. Attach single sink node at root of continuous query
+    let sinkNode = NodeSink viewName (makeIntegrator outSchema) outSchema
+        (sinkNodeId, g2) = addNode sinkNode g1
+        updatedGraph = addEdge rootNodeId sinkNodeId g2
+    -- 6. Register sink node in catalog as a queryable view
     let updatedCatalog = registerStream viewName outSchema eng.catalog
     Right eng.{catalog = updatedCatalog, graph = updatedGraph, viewManager = updatedViewMgr, streamNodes = streamBindings}
 
 --- Deploy physical operators into the dataflow graph and attach edges.
 deployPhysicalNodes :: PhysicalPlan
-                    -> String
-                    -> Schema
                     -> DataflowGraph ExecutionNode
                     -> TM.TreeMap String [NodeId]
                     -> Either String (NodeId, DataflowGraph ExecutionNode, TM.TreeMap String [NodeId])
-deployPhysicalNodes (PhysicalScan (StreamId sName) s _ _) viewName outSchema g streamBindings =
+deployPhysicalNodes (PhysicalScan (StreamId sName) s _ _) g streamBindings =
     case TM.lookup sName streamBindings of
-        Just (srcId:_) ->
-            -- Attach sink node to existing stream source
-            let sinkNode = NodeSink viewName (makeIntegrator outSchema) outSchema
-                (sinkId, g1) = addNode sinkNode g
-                g2 = addEdge srcId sinkId g1
-            in Right (sinkId, g2, streamBindings)
+        Just (srcId:_) -> Right (srcId, g, streamBindings)
         _ ->
             let srcNode = NodeSource sName s
                 (srcId, g1) = addNode srcNode g
-                sinkNode = NodeSink viewName (makeIntegrator outSchema) outSchema
-                (sinkId, g2) = addNode sinkNode g1
-                g3 = addEdge srcId sinkId g2
                 updatedBindings = TM.insert sName [srcId] streamBindings
-            in Right (sinkId, g3, updatedBindings)
+            in Right (srcId, g1, updatedBindings)
 
-deployPhysicalNodes (PhysicalFilter inp pred) viewName outSchema g streamBindings = do
-    (inpId, g1, b1) <- deployPhysicalNodes inp viewName (physicalSchema inp) g streamBindings
+deployPhysicalNodes (PhysicalFilter inp pred) g streamBindings = do
+    (inpId, g1, b1) <- deployPhysicalNodes inp g streamBindings
     let filterNode = NodeFilter pred (physicalSchema inp)
         (fId, g2) = addNode filterNode g1
         g3 = addEdge inpId fId g2
     Right (fId, g3, b1)
 
-deployPhysicalNodes (PhysicalProject inp exprs s) viewName outSchema g streamBindings = do
-    (inpId, g1, b1) <- deployPhysicalNodes inp viewName (physicalSchema inp) g streamBindings
+deployPhysicalNodes (PhysicalProject inp exprs s) g streamBindings = do
+    (inpId, g1, b1) <- deployPhysicalNodes inp g streamBindings
     let projectNode = NodeProject exprs s
         (pId, g2) = addNode projectNode g1
         g3 = addEdge inpId pId g2
     Right (pId, g3, b1)
 
-deployPhysicalNodes (PhysicalAggregate inp keys specs s) viewName outSchema g streamBindings = do
-    (inpId, g1, b1) <- deployPhysicalNodes inp viewName (physicalSchema inp) g streamBindings
+deployPhysicalNodes (PhysicalAggregate inp keys specs s) g streamBindings = do
+    (inpId, g1, b1) <- deployPhysicalNodes inp g streamBindings
     let aggNode = NodeAggregate keys specs empty s
         (aId, g2) = addNode aggNode g1
         g3 = addEdge inpId aId g2
-        sinkNode = NodeSink viewName (makeIntegrator s) s
-        (sinkId, g4) = addNode sinkNode g3
-        g5 = addEdge aId sinkId g4
-    Right (sinkId, g5, b1)
+    Right (aId, g3, b1)
 
-deployPhysicalNodes (PhysicalWindow inp wt idx s) viewName outSchema g streamBindings = do
-    (inpId, g1, b1) <- deployPhysicalNodes inp viewName (physicalSchema inp) g streamBindings
+deployPhysicalNodes (PhysicalWindow inp wt idx s) g streamBindings = do
+    (inpId, g1, b1) <- deployPhysicalNodes inp g streamBindings
     let winNode = NodeWindow wt idx s
         (wId, g2) = addNode winNode g1
         g3 = addEdge inpId wId g2
     Right (wId, g3, b1)
 
-deployPhysicalNodes (PhysicalJoin jt l r lKey rKey s) viewName outSchema g streamBindings = do
-    (lId, g1, b1) <- deployPhysicalNodes l viewName (physicalSchema l) g streamBindings
-    (rId, g2, b2) <- deployPhysicalNodes r viewName (physicalSchema r) g1 b1
+deployPhysicalNodes (PhysicalJoin jt l r lKey rKey s) g streamBindings = do
+    (lId, g1, b1) <- deployPhysicalNodes l g streamBindings
+    (rId, g2, b2) <- deployPhysicalNodes r g1 b1
     let joinState = makeJoinState lKey rKey
         joinNode  = NodeJoin joinState s
         (jId, g3) = addNode joinNode g2

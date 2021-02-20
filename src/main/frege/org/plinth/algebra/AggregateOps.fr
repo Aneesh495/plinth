@@ -129,8 +129,8 @@ stepAggregate :: [Int]                               -- Group key column indices
               -> (TM.TreeMap [Value] [AggAccumulator], StreamDelta)
 stepAggregate keyIndices specs outSchema stateMap delta =
     let entries = toEntries delta.changes
-        -- Process all delta entries and track modified group keys
-        (updatedMap, modifiedKeys) = fold updateEntry (stateMap, []) entries
+        -- Process all delta entries strictly to avoid lazy thunk accumulation
+        (updatedMap, modifiedKeys) = loopEntry stateMap [] entries
         -- Generate retraction of old outputs and insertion of new outputs
         emissionEvents = concatMap (generateGroupDiff stateMap updatedMap specs) (nub modifiedKeys)
         emissionDelta  = StreamDelta outSchema (fromEntries emissionEvents) delta.maxTimestamp
@@ -138,20 +138,28 @@ stepAggregate keyIndices specs outSchema stateMap delta =
   where
     extractKey tuple = [tuple !! idx | idx <- keyIndices, idx >= 0, idx < length tuple]
     
-    updateEntry (curMap, modKeys) (tuple, weight) =
+    loopEntry !curMap !modKeys [] = (curMap, modKeys)
+    loopEntry !curMap !modKeys ((tuple, weight):rest) =
         let k = extractKey tuple
             oldAccs = case TM.lookup k curMap of
                 Just accs -> accs
                 Nothing   -> replicate (length specs) emptyAccumulator
-            newAccs = zipWith (\spec acc ->
+            newAccs = strictAccs [
                 let val = if spec.argColIdx >= 0 && spec.argColIdx < length tuple
                           then tuple !! spec.argColIdx
                           else ValNull
-                in updateAccumulator spec.kind val weight acc) specs oldAccs
+                in updateAccumulator spec.kind val weight acc
+                | (spec, acc) <- zip specs oldAccs ]
             nextMap = if all (\acc -> acc.count <= 0L) newAccs
                       then TM.delete k curMap
                       else TM.insert k newAccs curMap
-        in (nextMap, k : modKeys)
+        in loopEntry nextMap (k : modKeys) rest
+
+    strictAccs [] = []
+    strictAccs (a:as) =
+        let !c = a.count
+            !s = a.sumVal
+        in a.{count = c, sumVal = s} : strictAccs as
 
     generateGroupDiff oldMap newMap sps k =
         let oldOutputOpt = case TM.lookup k oldMap of

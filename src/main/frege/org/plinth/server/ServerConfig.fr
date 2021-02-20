@@ -1,0 +1,41 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.server.ServerConfig
+    Description: Configuration parameters for embedded server, network ports, and buffer capacities.
+-}
+
+module org.plinth.server.ServerConfig where
+
+--- Configuration options for the Plinth streaming daemon.
+data ServerConfig = ServerConfig {
+    port                :: Int,
+    dataDirectory       :: String,
+    maxConnections      :: Int,
+    flushThresholdBytes :: Long,
+    watermarkIntervalMs :: Long,
+    enableWal           :: Bool
+}
+
+derive Eq ServerConfig
+derive Ord ServerConfig
+
+instance Show ServerConfig where
+    show c = "ServerConfig(port=" ++ show c.port ++
+             ", dir=" ++ c.dataDirectory ++
+             ", maxConn=" ++ show c.maxConnections ++
+             ", wal=" ++ show c.enableWal ++ ")"
+
+--- Default production server configuration.
+defaultConfig :: ServerConfig
+defaultConfig = ServerConfig {
+    port                = 9092,
+    dataDirectory       = "data/plinth",
+    maxConnections      = 1024,
+    flushThresholdBytes = 64L * 1024L * 1024L,
+    watermarkIntervalMs = 250L,
+    enableWal           = true
+}
+
+--- Construct custom server configuration.
+makeConfig :: Int -> String -> ServerConfig
+makeConfig p dir = defaultConfig.{port = p, dataDirectory = dir}

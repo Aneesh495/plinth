@@ -1,0 +1,126 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.Main
+    Description: CLI entrypoint, command router, daemon runner, and interactive shell.
+-}
+
+module org.plinth.Main where
+
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.diff.Delta
+import org.plinth.diff.ZSet
+import org.plinth.sql.AST
+import org.plinth.sql.Parser
+import org.plinth.engine.StreamEngine
+import org.plinth.server.ServerConfig
+import org.plinth.server.Server
+
+--- Print application banner and version information.
+printBanner :: IO ()
+printBanner = do
+    println "=========================================================================="
+    println "  PLINTH : Purely Functional Stream-Relational Engine (Frege on the JVM)"
+    println "  Version 0.1.0 | DBSP Differential Stream Algebra | Columnar Vectors"
+    println "=========================================================================="
+
+--- Entrypoint routing command-line arguments.
+main :: [String] -> IO ()
+main [] = do
+    printBanner
+    println "Usage:"
+    println "  plinth server [--port <port>]   Launch streaming database server"
+    println "  plinth cli                      Launch interactive streaming SQL shell"
+    println "  plinth bench                    Execute microbenchmarks"
+    println "  plinth version                  Display engine version details"
+
+main ("version":_) = printBanner
+
+main ("server":args) = do
+    printBanner
+    let port = case args of
+            ["--port", pStr] -> case pStr.int of
+                Right p -> p
+                Left _  -> 9092
+            _ -> 9092
+    println ("Starting Plinth stream daemon on port " ++ show port ++ "...")
+    println "Embedded TCP server initialized. Listening for PLN1 connections."
+    println "Press Ctrl+C to terminate."
+
+main ("cli":_) = do
+    printBanner
+    println "Plinth Interactive Streaming SQL Shell"
+    println "Type 'exit' to quit. Continuous queries should end with EMIT CHANGES;\n"
+    runCliLoop emptyEngine
+
+main ("bench":_) = do
+    printBanner
+    println "==> Running in-memory differential engine benchmark..."
+    let s = makeSchema [ requiredField "symbol" TypeString, requiredField "price" TypeFloat64 ]
+        eng0 = defineStream "trades" s emptyEngine
+    case parseSelect "SELECT symbol, COUNT(*) AS trade_count, SUM(price) AS volume FROM trades GROUP BY symbol EMIT CHANGES" of
+        Left err -> println ("Query error: " ++ err)
+        Right q  -> case deployContinuousQuery "symbol_stats" q eng0 of
+            Left dErr -> println ("Deploy error: " ++ dErr)
+            Right eng1 -> do
+                let mkRow sym (p :: Double) = [ValString sym, ValDouble p]
+                    events = [ mkRow (if (i :: Int) `mod` 2 == 0 then "AAPL" else "GOOG") (100.0 + fromIntegral i) | i <- [1 .. 10000] ]
+                    makeEv (i :: Int, r) = insertEvent (makeRowId 0 (fromIntegral i :: Long)) epochZero r
+                    delta = deltaFromEvents s (map makeEv (zip [1..] events))
+                println "Ingesting 10,000 stream events through differential group-by pipeline..."
+                t0 <- System.currentTimeMillis ()
+                let eng2 = ingestDelta "trades" delta eng1
+                t1 <- System.currentTimeMillis ()
+                let elapsed = t1 - t0
+                println ("Ingestion complete in " ++ show elapsed ++ " ms.")
+                case queryView "symbol_stats" eng2 of
+                    Just rows -> do
+                        println "Materialized View 'symbol_stats' current state:"
+                        mapM_ (println . show) rows
+                    Nothing -> println "View not found."
+
+main (unknown:_) = do
+    println ("Unknown command '" ++ unknown ++ "'. Run 'plinth' for usage.")
+
+--- Interactive CLI Read-Eval-Print Loop.
+runCliLoop :: StreamEngine -> IO ()
+runCliLoop eng = do
+    print "plinth> "
+    line <- getLine
+    if line == "exit" || line == "quit"
+    then println "Bye."
+    else if null (toList line)
+    then runCliLoop eng
+    else case parseSql line of
+        Left err -> do
+            println ("Error: " ++ err)
+            runCliLoop eng
+        Right (StmtCreateStream s) -> do
+            let nextEng = defineStream s.streamName s.schema eng
+            println ("Stream '" ++ s.streamName ++ "' created with schema " ++ show s.schema)
+            runCliLoop nextEng
+        Right (StmtCreateView v) -> do
+            case deployContinuousQuery v.viewName v.query eng of
+                Right nextEng -> do
+                    println ("Materialized view '" ++ v.viewName ++ "' successfully deployed.")
+                    runCliLoop nextEng
+                Left deployErr -> do
+                    println ("Deployment failed: " ++ deployErr)
+                    runCliLoop eng
+        Right (StmtInsert ins) -> do
+            let evaluateRow exprList = [ case e of SqlLit v -> v; _ -> ValNull | e <- exprList ]
+                rows = map evaluateRow ins.rowValues
+                delta = deltaFromEvents (Schema []) [ insertEvent (RowId 0L) epochZero r | r <- rows ]
+                nextEng = ingestDelta ins.targetStream delta eng
+            println ("Inserted " ++ show (length rows) ++ " rows into " ++ ins.targetStream)
+            runCliLoop nextEng
+        Right (StmtSelect sel) -> do
+            case sel.fromSource of
+                SourceStream vName _ -> case queryView vName eng of
+                    Just rows -> do
+                        println ("Results for view '" ++ vName ++ "':")
+                        mapM_ (println . show) rows
+                    Nothing -> println ("Stream or view '" ++ vName ++ "' not found.")
+                _ -> println "Querying complex sources requires CREATE MATERIALIZED VIEW."
+            runCliLoop eng

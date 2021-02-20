@@ -1,0 +1,105 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.server.Server
+    Description: Embedded TCP server daemon, session routing, and SQL command execution.
+-}
+
+module org.plinth.server.Server where
+
+import frege.data.TreeMap as TM
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.diff.Delta
+import org.plinth.sql.AST
+import org.plinth.sql.Parser
+import org.plinth.engine.StreamEngine
+import org.plinth.protocol.Message
+import org.plinth.protocol.Framing
+import org.plinth.server.ServerConfig
+import org.plinth.server.Session
+
+--- Global mutable/functional state maintained across active sessions and streaming engine.
+data ServerState = ServerState {
+    engine     :: StreamEngine,
+    sessions   :: TM.TreeMap Long ClientSession,
+    seqCounter :: Long
+}
+
+instance Show ServerState where
+    show ss = "ServerState(sessions=" ++ show (TM.size ss.sessions) ++
+              ", engine=" ++ show ss.engine ++ ")"
+
+--- Initial empty server state.
+emptyServerState :: ServerState
+emptyServerState = ServerState emptyEngine empty 1L
+
+--- Process an incoming raw framed message from a client session.
+--- Returns an updated ServerState and an optional serialized response frame to send back.
+handleClientFrame :: Long -> String -> ServerState -> (ServerState, Maybe String)
+handleClientFrame sid rawPayload st = case decodeFrame rawPayload of
+    Left decodeErr ->
+        let errResp = MsgError 400 ("Protocol framing error: " ++ decodeErr)
+            respFrame = encodeFrame st.seqCounter errResp
+        in (st.{seqCounter = st.seqCounter + 1L}, Just respFrame)
+    Right (msg, seqN) ->
+        let (nextSt, respMsg) = processMessage sid msg st
+            respFrame = encodeFrame st.seqCounter respMsg
+        in (nextSt.{seqCounter = nextSt.seqCounter + 1L}, Just respFrame)
+
+--- Core message dispatching logic.
+processMessage :: Long -> WireMessage -> ServerState -> (ServerState, WireMessage)
+processMessage sid (MsgConnect cName _) st =
+    let session = makeSession sid cName epochZero
+        updatedSessions = TM.insert sid session st.sessions
+        resp = MsgConnectAck "0.1.0" sid 0
+    in (st.{sessions = updatedSessions}, resp)
+
+processMessage sid (MsgExecuteQuery sqlText) st =
+    case parseSql sqlText of
+        Left parseErr ->
+            (st, MsgError 400 ("SQL parse error: " ++ parseErr))
+        Right (StmtCreateStream s) ->
+            let updatedEng = defineStream s.streamName s.schema st.engine
+            in (st.{engine = updatedEng}, MsgAck st.seqCounter ("Stream '" ++ s.streamName ++ "' created successfully"))
+        Right (StmtCreateView v) ->
+            case deployContinuousQuery v.viewName v.query st.engine of
+                Right updatedEng ->
+                    (st.{engine = updatedEng}, MsgAck st.seqCounter ("Materialized view '" ++ v.viewName ++ "' deployed"))
+                Left deployErr ->
+                    (st, MsgError 500 ("View deployment error: " ++ deployErr))
+        Right (StmtInsert ins) ->
+            -- Convert inserted AST expressions to Values
+            let evaluateRow exprList = [ case e of SqlLit v -> v; _ -> ValNull | e <- exprList ]
+                rows = map evaluateRow ins.rowValues
+                delta = deltaFromEvents (Schema []) [ insertEvent (RowId 0L) epochZero r | r <- rows ]
+                updatedEng = ingestDelta ins.targetStream delta st.engine
+            in (st.{engine = updatedEng}, MsgAck st.seqCounter ("Inserted " ++ show (length rows) ++ " rows into " ++ ins.targetStream))
+        Right (StmtSelect sel) ->
+            -- Check if query targets a registered Materialized View
+            case sel.fromSource of
+                SourceStream vName _ -> case queryView vName st.engine of
+                    Just rows ->
+                        (st, MsgRowBatch vName rows true)
+                    Nothing ->
+                        (st, MsgError 404 ("Stream or view '" ++ vName ++ "' not found"))
+                _ ->
+                    (st, MsgError 501 ("Ad-hoc streaming joins must be deployed via CREATE MATERIALIZED VIEW"))
+
+processMessage sid (MsgBatchInsert sName rows) st =
+    let delta = deltaFromEvents (Schema []) [ insertEvent (RowId 0L) epochZero r | r <- rows ]
+        updatedEng = ingestDelta sName delta st.engine
+    in (st.{engine = updatedEng}, MsgAck st.seqCounter ("Batch inserted " ++ show (length rows) ++ " rows"))
+
+processMessage sid (MsgSubscribeStream targetName _) st =
+    case TM.lookup sid st.sessions of
+        Just sess ->
+            let updatedSess = addSubscription targetName sess
+                updatedSessions = TM.insert sid updatedSess st.sessions
+            in (st.{sessions = updatedSessions}, MsgAck st.seqCounter ("Subscribed to " ++ targetName))
+        Nothing ->
+            (st, MsgError 401 "Unrecognized session ID")
+
+processMessage _ MsgPing st = (st, MsgPong)
+processMessage _ MsgPong st = (st, MsgAck st.seqCounter "PONG_ACK")
+processMessage _ other st   = (st, MsgError 501 ("Unhandled wire message: " ++ show other))
