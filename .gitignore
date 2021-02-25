@@ -16,6 +16,8 @@ target/
 *.dylib
 *.dll
 c_src/*.o
+c_src/src/*.o
+c_src/libplinth.a
 c_src/libplinth_client.*
 c_src/test_client
 
