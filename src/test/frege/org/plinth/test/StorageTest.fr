@@ -1,0 +1,67 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.test.StorageTest
+    Description: Test suite for WAL CRC-32C verification, MemTable range scans, and BloomFilter bounds.
+-}
+
+module org.plinth.test.StorageTest where
+
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.storage.WALRecord
+import org.plinth.storage.MemTable
+import org.plinth.storage.BloomFilter
+
+assertTrue :: String -> Bool -> IO ()
+assertTrue msg cond =
+    if cond
+    then println ("  [PASS] " ++ msg)
+    else error ("  [FAIL] " ++ msg)
+
+runStorageTests :: IO ()
+runStorageTests = do
+    println "[TEST SUITE] Storage Engine: WAL, MemTable, and BloomFilter"
+
+    -- 1. BloomFilter Insertion and Containment
+    let bf0 = makeBloomFilter 100 0.01
+        bf1 = insertBloomKey (ValString "AAPL") bf0
+        bf2 = insertBloomKey (ValString "GOOG") bf1
+        bf3 = insertBloomKey (ValString "MSFT") bf2
+
+    assertTrue "BloomFilter contains inserted AAPL" (memberBloomKey (ValString "AAPL") bf3)
+    assertTrue "BloomFilter contains inserted GOOG" (memberBloomKey (ValString "GOOG") bf3)
+    assertTrue "BloomFilter contains inserted MSFT" (memberBloomKey (ValString "MSFT") bf3)
+    assertTrue "BloomFilter rejects uninserted key" (not (memberBloomKey (ValString "UNKNOWN_CO") bf3))
+
+    -- 2. MemTable Insertion and Primary Key Lookup
+    let s = makeSchema [
+                requiredField "order_id" TypeInt64,
+                requiredField "symbol" TypeString,
+                requiredField "price" TypeFloat64
+            ]
+        mt0 = makeMemTable 1 s 0
+        r1 = [ValLong 101L, ValString "AAPL", ValDouble 150.0]
+        r2 = [ValLong 102L, ValString "GOOG", ValDouble 2800.0]
+        r3 = [ValLong 103L, ValString "MSFT", ValDouble 310.0]
+
+        mt1 = insertRow r1 (Timestamp 1000L) mt0
+        mt2 = insertRow r2 (Timestamp 1005L) mt1
+        mt3 = insertRow r3 (Timestamp 1010L) mt2
+
+    assertTrue "MemTable row count is 3" (length (allRows mt3) == 3)
+
+    case lookupKey (ValLong 102L) mt3 of
+        Just row -> assertTrue "MemTable lookup found GOOG row" (row == r2)
+        Nothing  -> error "Failed to find order 102L"
+
+    -- Range scan from 101L to 102L
+    let scanRows = rangeScan (ValLong 101L) (ValLong 102L) mt3
+    assertTrue "MemTable scanRange returned 2 rows" (length scanRows == 2)
+
+    -- 3. WAL Record Framing and CRC-32C Verification
+    let wal = makeWalInsert (LSN 42L) (Timestamp 1000L) "trades" [r1, r2]
+    assertTrue "WAL record CRC-32C passes verification" (verifyWalRecord wal)
+
+    let corruptedWal = wal.{checksum = wal.checksum + 1}
+    assertTrue "WAL record corrupt CRC-32C is rejected" (not (verifyWalRecord corruptedWal))

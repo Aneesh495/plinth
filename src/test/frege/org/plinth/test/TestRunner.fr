@@ -1,0 +1,40 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.test.TestRunner
+    Description: Comprehensive test runner executing all unit, property, and invariant fuzz suites.
+-}
+
+module org.plinth.test.TestRunner where
+
+import org.plinth.test.ZSetTest
+import org.plinth.test.DifferentialTest
+import org.plinth.test.VectorTest
+import org.plinth.test.ParserTest
+import org.plinth.test.StorageTest
+import org.plinth.test.InvariantFuzzTest
+
+main :: [String] -> IO ()
+main _ = do
+    println "=========================================================================="
+    println "  PLINTH COMPREHENSIVE VERIFICATION SUITE"
+    println "=========================================================================="
+    t0 <- System.currentTimeMillis ()
+
+    runZSetTests
+    println ""
+    runDifferentialTests
+    println ""
+    runVectorTests
+    println ""
+    runParserTests
+    println ""
+    runStorageTests
+    println ""
+    runInvariantFuzzTests
+
+    t1 <- System.currentTimeMillis ()
+    let elapsed = t1 - t0
+    println ""
+    println "=========================================================================="
+    println ("  ALL TESTS PASSED SUCCESSFULLY in " ++ show elapsed ++ " ms.")
+    println "=========================================================================="

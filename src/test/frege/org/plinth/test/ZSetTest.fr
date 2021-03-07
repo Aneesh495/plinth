@@ -1,0 +1,54 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.test.ZSetTest
+    Description: Algebraic Abelian group verification suite for ZSet relations.
+-}
+
+module org.plinth.test.ZSetTest where
+
+import org.plinth.diff.ZSet
+
+assertTrue :: String -> Bool -> IO ()
+assertTrue msg cond =
+    if cond
+    then println ("  [PASS] " ++ msg)
+    else error ("  [FAIL] " ++ msg)
+
+runZSetTests :: IO ()
+runZSetTests = do
+    println "[TEST SUITE] ZSet Abelian Group Axioms"
+
+    let a = fromEntries [("AAPL", 5L), ("GOOG", 3L), ("MSFT", 2L)]
+        b = fromEntries [("AAPL", -2L), ("GOOG", 4L), ("AMZN", 7L)]
+        c = fromEntries [("MSFT", -2L), ("AMZN", 1L), ("TSLA", 10L)]
+
+    -- 1. Identity Axiom: A + 0 = A and 0 + A = A
+    assertTrue "Identity law: A + 0 = A" (addZSets a emptyZSet == a)
+    assertTrue "Identity law: 0 + A = A" (addZSets emptyZSet a == a)
+
+    -- 2. Inverse Axiom: A + (-A) = 0
+    assertTrue "Inverse law: A + (-A) = 0" (addZSets a (negateZSet a) == emptyZSet)
+
+    -- 3. Commutativity: A + B = B + A
+    assertTrue "Commutativity law: A + B = B + A" (addZSets a b == addZSets b a)
+
+    -- 4. Associativity: (A + B) + C = A + (B + C)
+    assertTrue "Associativity law: (A + B) + C = A + (B + C)"
+               (addZSets (addZSets a b) c == addZSets a (addZSets b c))
+
+    -- 5. Subtraction: A - B = A + (-B) and A - A = 0
+    assertTrue "Subtraction cancellation: A - A = 0" (subZSets a a == emptyZSet)
+    assertTrue "Subtraction definition: A - B = A + (-B)" (subZSets a b == addZSets a (negateZSet b))
+
+    -- 6. Scalar Multiplication: 3A = A + A + A
+    let a3 = scaleZSet 3L a
+        aPlusAPlusA = addZSets a (addZSets a a)
+    assertTrue "Distributive scaling: 3A = A + A + A" (a3 == aPlusAPlusA)
+    assertTrue "Zero scaling: 0A = 0" (scaleZSet 0L a == emptyZSet)
+
+    -- 7. Element weight lookup and cancellation
+    let z0 = emptyZSet
+        z1 = insertWeight "NVDA" 10L z0
+        z2 = insertWeight "NVDA" (-10L) z1
+    assertTrue "Zero cancellation removes key completely" (isZSetEmpty z2)
+    assertTrue "Weight lookup on absent element returns 0" (lookupWeight "NVDA" z2 == 0L)

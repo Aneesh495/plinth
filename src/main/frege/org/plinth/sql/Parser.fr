@@ -30,9 +30,10 @@ parseSql input = case tokenize input of
     Left err   -> Left ("Lexical error: " ++ err)
     Right toks -> case parseStmt (ParserState toks) of
         Right (stmt, st) ->
-            if isEof st
-            then Right stmt
-            else Left ("Unexpected trailing tokens starting at " ++ show (peekPos st))
+            let st1 = if peekToken st == TokSemicolon then advance st else st
+            in if isEof st1
+               then Right stmt
+               else Left ("Unexpected trailing tokens starting at " ++ show (peekPos st1))
         Left err -> Left err
 
 --- Parse a SELECT continuous query string.

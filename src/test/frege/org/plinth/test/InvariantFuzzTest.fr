@@ -1,0 +1,99 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.test.InvariantFuzzTest
+    Description: Differential IVM vs Batch Ground-Truth Equivalence Fuzzing.
+-}
+
+module org.plinth.test.InvariantFuzzTest where
+
+import frege.data.TreeMap as TM
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.diff.Delta
+import org.plinth.sql.Parser
+import org.plinth.engine.StreamEngine
+
+assertTrue :: String -> Bool -> IO ()
+assertTrue msg cond =
+    if cond
+    then println ("  [PASS] " ++ msg)
+    else error ("  [FAIL] " ++ msg)
+
+-- Linear congruential pseudo-random number generator
+nextRand :: Long -> Long
+nextRand seed = seed * 6364136223846793005L + 1442695040888963407L
+
+symbols :: [String]
+symbols = ["AAPL", "GOOG", "MSFT", "AMZN"]
+
+runInvariantFuzzTests :: IO ()
+runInvariantFuzzTests = do
+    println "[TEST SUITE] Differential IVM vs Batch Ground-Truth Fuzzing"
+
+    let s = makeSchema [ requiredField "symbol" TypeString, requiredField "price" TypeFloat64 ]
+        eng0 = defineStream "trades" s emptyEngine
+
+    case parseSelect "SELECT symbol, COUNT(*) AS trade_count, SUM(price) AS volume FROM trades GROUP BY symbol EMIT CHANGES" of
+        Left err -> error ("Query parse error: " ++ err)
+        Right q -> case deployContinuousQuery "fuzz_view" q eng0 of
+            Left dErr -> error ("Deploy continuous query error: " ++ dErr)
+            Right eng1 -> do
+                -- Generate 500 pseudorandom stream events
+                let genEvents :: Int -> Long -> [StreamEvent] -> [StreamEvent]
+                    genEvents 0 _ acc = reverse acc
+                    genEvents n seed acc =
+                        let s1 = nextRand seed
+                            symIdx = fromIntegral (abs (s1 `rem` 4L)) :: Int
+                            sym = symbols !! symIdx
+                            s2 = nextRand s1
+                            price = 100.0 + fromIntegral (abs (s2 `rem` 500L)) :: Double
+                            s3 = nextRand s2
+                            isInsert = (s3 `rem` 10L) /= 0L -- 90% inserts, 10% retractions
+                            row = [ValString sym, ValDouble price]
+                            nLong = fromIntegral n :: Long
+                            ev = if isInsert
+                                 then insertEvent (makeRowId 0 nLong) (Timestamp (1000L + nLong)) row
+                                 else deleteEvent (makeRowId 0 nLong) (Timestamp (1000L + nLong)) row
+                        in genEvents (n - 1) s3 (ev : acc)
+
+                let streamEvents = genEvents 500 123456789L []
+                    delta = deltaFromEvents s streamEvents
+                    eng2 = ingestDelta "trades" delta eng1
+
+                -- Compute Ground Truth directly in a batch fold
+                let updateBatch :: TM.TreeMap String (Long, Double) -> StreamEvent -> TM.TreeMap String (Long, Double)
+                    updateBatch acc (ev :: StreamEvent) =
+                        case ev.tuple of
+                            [ValString sym, ValDouble p] ->
+                                let (curCount, curSum) = case TM.lookup sym acc of
+                                        Just (c, v) -> (c, v)
+                                        Nothing     -> (0L, 0.0)
+                                    wLong = ev.weight
+                                    wDouble = fromIntegral wLong :: Double
+                                    newCount = curCount + wLong
+                                    newSum   = curSum + wDouble * p
+                                in TM.insert sym (newCount, newSum) acc
+                            _ -> acc
+
+                    accumulatedMap = fold updateBatch empty streamEvents
+                    groundTruthMap = TM.filterWithKey (\_ (c, _) -> c > 0L) accumulatedMap
+
+                -- Query materialized view from engine
+                case queryView "fuzz_view" eng2 of
+                    Nothing -> error "fuzz_view not found in engine"
+                    Just viewRows -> do
+                        assertTrue "Materialized view produced active rows" (not (null viewRows))
+
+                        -- Verify each symbol in ground truth matches viewRows exactly
+                        forM_ (TM.each groundTruthMap) $ \(sym, (expCount, expSum)) -> do
+                            let matching = [ r | r <- viewRows, case r of (ValString s:_) -> s == sym; _ -> false ]
+                            case matching of
+                                [[ValString _, ValLong actCount, ValDouble actSum]] -> do
+                                    assertTrue ("Symbol " ++ sym ++ " row count matches ground truth (" ++ show expCount ++ ")")
+                                               (actCount == expCount)
+                                    assertTrue ("Symbol " ++ sym ++ " volume matches ground truth (" ++ show expSum ++ ")")
+                                               (abs (actSum - expSum) < 1e-4)
+                                _ -> error ("Ground truth symbol " ++ sym ++ " missing or ambiguous in view")
+
+                        println "  [VERIFIED] Differential stream IVM matches Batch ground-truth recomputation exactly!"

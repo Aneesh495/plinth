@@ -1,0 +1,71 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.test.DifferentialTest
+    Description: Verification of formal DBSP differential operator calculus and retraction algebra.
+-}
+
+module org.plinth.test.DifferentialTest where
+
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.diff.ZSet
+import org.plinth.diff.Delta
+import org.plinth.diff.Differential
+
+assertTrue :: String -> Bool -> IO ()
+assertTrue msg cond =
+    if cond
+    then println ("  [PASS] " ++ msg)
+    else error ("  [FAIL] " ++ msg)
+
+runDifferentialTests :: IO ()
+runDifferentialTests = do
+    println "[TEST SUITE] DBSP Differential Stream Calculus"
+
+    let s = makeSchema [ requiredField "symbol" TypeString, requiredField "price" TypeFloat64 ]
+        row1 = [ValString "AAPL", ValDouble 150.0]
+        row2 = [ValString "GOOG", ValDouble 2800.0]
+        row3 = [ValString "MSFT", ValDouble 300.0]
+
+        ev1 = insertEvent (makeRowId 0 1L) (Timestamp 1000L) row1
+        ev2 = insertEvent (makeRowId 0 2L) (Timestamp 1005L) row2
+        ev3 = insertEvent (makeRowId 0 3L) (Timestamp 1010L) row3
+
+        d1 = deltaFromEvents s [ev1, ev2]
+        d2 = deltaFromEvents s [ev3]
+
+    -- 1. Linear Operator Linearity: Filter(d1 + d2) = Filter(d1) + Filter(d2)
+    let combined = combineDeltas d1 d2
+        isAapl [ValString sym, _] = sym == "AAPL"
+        isAapl _ = false
+
+        filteredCombined = dFilter isAapl combined
+        filteredSeparate = combineDeltas (dFilter isAapl d1) (dFilter isAapl d2)
+
+    assertTrue "Filter linearity: dFilter(d1 + d2) == dFilter(d1) + dFilter(d2)"
+               (filteredCombined.changes == filteredSeparate.changes)
+
+    -- 2. State Snapshot Integration and Retraction Equivalence
+    let snap0 = emptySnapshot s
+        snap1 = applyDelta snap0 d1
+    assertTrue "Snapshot accumulates d1 rows" (zsetSize snap1.relation == 2)
+
+    -- Create retraction event for row1
+    let evRetract = deleteEvent (makeRowId 0 1L) (Timestamp 1020L) row1
+        dRetract = deltaFromEvents s [evRetract]
+        snap2 = applyDelta snap1 dRetract
+
+    assertTrue "Retraction delta cancels inserted tuple in snapshot"
+               (lookupWeight row1 snap2.relation == 0L)
+    assertTrue "Snapshot size drops to 1 after retraction"
+               (zsetSize snap2.relation == 1)
+    assertTrue "Remaining row is still present"
+               (lookupWeight row2 snap2.relation == 1L)
+
+    -- 3. Projection Distributivity
+    let projSchema = makeSchema [ requiredField "symbol" TypeString ]
+        pCombined = dProject projSchema [0] combined
+        pSeparate = combineDeltas (dProject projSchema [0] d1) (dProject projSchema [0] d2)
+    assertTrue "Projection linearity: dProject(d1 + d2) == dProject(d1) + dProject(d2)"
+               (pCombined.changes == pSeparate.changes)

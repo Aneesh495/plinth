@@ -1,0 +1,77 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.test.VectorTest
+    Description: Columnar vector representations, record batches, and compression round-trip tests.
+-}
+
+module org.plinth.test.VectorTest where
+
+import org.plinth.common.Types
+import org.plinth.common.Schema
+import org.plinth.common.Value
+import org.plinth.vector.ColumnVector
+import org.plinth.vector.VectorBatch
+import org.plinth.vector.Compression
+
+assertTrue :: String -> Bool -> IO ()
+assertTrue msg cond =
+    if cond
+    then println ("  [PASS] " ++ msg)
+    else error ("  [FAIL] " ++ msg)
+
+runVectorTests :: IO ()
+runVectorTests = do
+    println "[TEST SUITE] Columnar Vector Execution & Compression"
+
+    -- 1. ColumnVector Construction & Nullability
+    let vals = [ValString "AAPL", ValNull, ValString "GOOG", ValString "AAPL"]
+        cv = fromValues TypeString vals
+
+    assertTrue "Vector length equals element count" (columnVectorLength cv == 4)
+    assertTrue "Vector null count matches" (columnVectorNullCount cv == 1)
+    assertTrue "Null validity bit checked correctly" (isNull (columnVectorGet 1 cv))
+    assertTrue "Non-null validity bit checked correctly" (not (isNull (columnVectorGet 0 cv)))
+
+    -- 2. VectorBatch Construction & Slicing
+    let s = makeSchema [
+                requiredField "symbol" TypeString,
+                requiredField "price" TypeFloat64
+            ]
+        pVals = [ValDouble 150.0, ValDouble 200.0, ValDouble 2800.0, ValDouble 152.0]
+        pCol = fromValues TypeFloat64 pVals
+    case makeVectorBatch s [cv, pCol] of
+        Nothing -> error "Failed to create VectorBatch"
+        Just batch -> do
+            assertTrue "VectorBatch row count matches" (batch.rowCount == 4)
+            assertTrue "VectorBatch column count matches" (length batch.columns == 2)
+
+            let sliced = sliceBatch 1 2 batch
+            assertTrue "Sliced batch row count is 2" (sliced.rowCount == 2)
+
+    -- 3. Run-Length Encoding (RLE) Round-Trip
+    let rleVals = [ValInt 10, ValInt 10, ValInt 10, ValInt 20, ValInt 20, ValInt 30]
+        rleCol = fromValues TypeInt32 rleVals
+        compressedRLE = encodeRLE rleCol
+        decompressedRLE = decompress compressedRLE
+
+    assertTrue "RLE decompress produces original values"
+               (toValues decompressedRLE == rleVals)
+
+    -- 4. Dictionary Encoding Round-Trip
+    let dictVals = [ValString "US", ValString "EU", ValString "US", ValString "APAC", ValString "EU"]
+        dictCol = fromValues TypeString dictVals
+        compressedDict = encodeDict dictCol
+        decompressedDict = decompress compressedDict
+
+    assertTrue "Dictionary decompress produces original values"
+               (toValues decompressedDict == dictVals)
+
+    -- 5. Delta Encoding Round-Trip
+    let deltaVals = [ValLong 1000L, ValLong 1005L, ValLong 1012L, ValLong 1015L]
+        deltaCol = fromValues TypeInt64 deltaVals
+    case encodeDelta deltaCol of
+        Just compressedDelta -> do
+            let decompressedDelta = decompress compressedDelta
+            assertTrue "Delta decompress produces original values"
+                       (toValues decompressedDelta == deltaVals)
+        Nothing -> error "Failed to encode delta"

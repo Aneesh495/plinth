@@ -1,0 +1,59 @@
+{-
+    Plinth Stream-Relational Engine
+    Module: org.plinth.test.ParserTest
+    Description: Comprehensive test suite for streaming SQL lexer, Pratt parser, and AST validation.
+-}
+
+module org.plinth.test.ParserTest where
+
+import org.plinth.algebra.Operator
+import org.plinth.sql.Token
+import org.plinth.sql.Lexer
+import org.plinth.sql.AST
+import org.plinth.sql.Parser
+
+assertTrue :: String -> Bool -> IO ()
+assertTrue msg cond =
+    if cond
+    then println ("  [PASS] " ++ msg)
+    else error ("  [FAIL] " ++ msg)
+
+runParserTests :: IO ()
+runParserTests = do
+    println "[TEST SUITE] Streaming SQL Lexer and Parser"
+
+    -- 1. Lexer Token Classification
+    case tokenize "SELECT symbol, price * 1.05 FROM trades WHERE price >= 100.0;" of
+        Left err -> error ("Tokenize failed: " ++ err)
+        Right toks -> do
+            assertTrue "Tokens generated" (length toks > 5)
+            assertTrue "First token is KwSelect" (toks.head.kind == KwSelect)
+
+    -- 2. DDL: CREATE STREAM
+    let createSql = "CREATE STREAM orders (order_id BIGINT NOT NULL, symbol STRING, price DOUBLE);"
+    case parseSql createSql of
+        Left err -> error ("CREATE STREAM parse error: " ++ err)
+        Right (StmtCreateStream s) -> do
+            assertTrue "Stream name parsed" (s.streamName == "orders")
+            assertTrue "Schema has 3 fields" (length s.schema.fields == 3)
+        Right _ -> error "Expected StmtCreateStream"
+
+    -- 3. Continuous Query: SELECT ... GROUP BY ... EMIT CHANGES
+    let querySql = "SELECT symbol, COUNT(*) AS cnt, SUM(price) AS vol FROM trades WHERE price > 50.0 GROUP BY symbol EMIT CHANGES"
+    case parseSelect querySql of
+        Left err -> error ("SELECT query parse error: " ++ err)
+        Right s -> do
+            assertTrue "SELECT has projection items" (length s.projection == 3)
+            assertTrue "SELECT has WHERE predicate" (case s.whereClause of Just _ -> true; Nothing -> false)
+            assertTrue "SELECT has GROUP BY keys" (length s.groupBy == 1)
+            assertTrue "Continuous query has EMIT CHANGES" s.emitChanges
+
+    -- 4. Pratt Expression Precedence Climbing (* has higher precedence than +)
+    case parseExpression "10 + 20 * 30" of
+        Left err -> error ("Expression parse error: " ++ err)
+        Right (SqlBinOp op1 l1 r1) -> do
+            assertTrue "Top-level operator is +" (op1 == OpAdd)
+            case r1 of
+                SqlBinOp op2 _ _ -> assertTrue "Right child is *" (op2 == OpMul)
+                _ -> error "Expected right child to be multiplication"
+        Right _ -> error "Expected binary op"
