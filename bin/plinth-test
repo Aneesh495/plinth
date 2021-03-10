@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Run Plinth comprehensive verification suite
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec java -Xss8m -Xmx2g -cp "${DIR}/lib/frege.jar:${DIR}/build/classes/java:${DIR}/build/classes/frege" org.plinth.test.TestRunner "$@"

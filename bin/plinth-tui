@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Run Plinth real-time terminal dashboard
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PYTHONPATH="${DIR}/python:${PYTHONPATH:-}"
+exec python3 -m plinth.tui "$@"
